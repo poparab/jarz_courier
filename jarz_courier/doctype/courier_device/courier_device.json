@@ -1,0 +1,184 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "naming_series:",
+ "creation": "2026-08-05 00:00:00.000000",
+ "description": "A phone bound to a courier. One active device per courier; binding a new one deactivates the previous.",
+ "doctype": "DocType",
+ "editable_grid": 0,
+ "engine": "InnoDB",
+ "field_order": [
+  "naming_series",
+  "party_type",
+  "party",
+  "user",
+  "column_break_party",
+  "is_active",
+  "bound_on",
+  "unbound_on",
+  "section_break_device",
+  "device_id",
+  "app_version",
+  "column_break_device",
+  "os_version",
+  "device_model",
+  "section_break_push",
+  "fcm_token",
+  "last_seen_on",
+  "section_break_notes",
+  "notes"
+ ],
+ "fields": [
+  {
+   "default": "CDEV-.#####",
+   "fieldname": "naming_series",
+   "fieldtype": "Select",
+   "label": "Series",
+   "options": "CDEV-.#####",
+   "reqd": 1
+  },
+  {
+   "fieldname": "party_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Party Type",
+   "options": "\nEmployee\nSupplier",
+   "reqd": 1
+  },
+  {
+   "description": "The courier this device belongs to. Matches Sales Invoice.custom_courier_party.",
+   "fieldname": "party",
+   "fieldtype": "Dynamic Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Party",
+   "options": "party_type",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "description": "Login the device was bound from. Informational: identity is resolved from Employee.user_id at request time, never from this field.",
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "label": "User",
+   "options": "User",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_party",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "1",
+   "description": "Only one device per courier may be active. Activating this one deactivates the rest.",
+   "fieldname": "is_active",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Is Active"
+  },
+  {
+   "fieldname": "bound_on",
+   "fieldtype": "Datetime",
+   "label": "Bound On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "unbound_on",
+   "fieldtype": "Datetime",
+   "label": "Unbound On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_device",
+   "fieldtype": "Section Break",
+   "label": "Device"
+  },
+  {
+   "description": "Stable per-install identifier reported by the courier app. Not unique at the DB level on purpose: a handset handed to another courier must be bindable again, and the old row is kept as history.",
+   "fieldname": "device_id",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Device ID",
+   "length": 140,
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "app_version",
+   "fieldtype": "Data",
+   "label": "App Version",
+   "length": 60
+  },
+  {
+   "fieldname": "column_break_device",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "os_version",
+   "fieldtype": "Data",
+   "label": "OS Version",
+   "length": 60
+  },
+  {
+   "fieldname": "device_model",
+   "fieldtype": "Data",
+   "label": "Device Model",
+   "length": 140
+  },
+  {
+   "fieldname": "section_break_push",
+   "fieldtype": "Section Break",
+   "label": "Push"
+  },
+  {
+   "description": "FCM registration token. Rotates on the device; the app re-registers and this is overwritten.",
+   "fieldname": "fcm_token",
+   "fieldtype": "Small Text",
+   "label": "FCM Token"
+  },
+  {
+   "fieldname": "last_seen_on",
+   "fieldtype": "Datetime",
+   "label": "Last Seen On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_notes",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "notes",
+   "fieldtype": "Small Text",
+   "label": "Notes"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-08-05 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Jarz Courier",
+ "name": "Courier Device",
+ "naming_rule": "By \"Naming Series\" field",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "party",
+ "track_changes": 1
+}

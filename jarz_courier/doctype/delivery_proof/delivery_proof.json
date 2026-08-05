@@ -1,0 +1,201 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "naming_series:",
+ "creation": "2026-08-05 00:00:00.000000",
+ "description": "Evidence captured at a customer's door: a photo, a signature or an OTP, with the coordinates the courier stood at.",
+ "doctype": "DocType",
+ "editable_grid": 0,
+ "engine": "InnoDB",
+ "field_order": [
+  "naming_series",
+  "sales_invoice",
+  "proof_type",
+  "column_break_head",
+  "party_type",
+  "party",
+  "duty",
+  "section_break_proof",
+  "file",
+  "recipient_name",
+  "column_break_proof",
+  "captured_at",
+  "request_id",
+  "section_break_geo",
+  "latitude",
+  "longitude",
+  "column_break_geo",
+  "accuracy_m",
+  "is_mocked",
+  "section_break_notes",
+  "notes"
+ ],
+ "fields": [
+  {
+   "default": "DPRF-.#####",
+   "fieldname": "naming_series",
+   "fieldtype": "Select",
+   "label": "Series",
+   "options": "DPRF-.#####",
+   "reqd": 1
+  },
+  {
+   "fieldname": "sales_invoice",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Sales Invoice",
+   "options": "Sales Invoice",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "proof_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Proof Type",
+   "options": "\nPhoto\nSignature\nOTP",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_head",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "party_type",
+   "fieldtype": "Select",
+   "label": "Party Type",
+   "options": "\nEmployee\nSupplier",
+   "read_only": 1
+  },
+  {
+   "description": "The courier who captured this proof, resolved server-side from the session — never sent by the client.",
+   "fieldname": "party",
+   "fieldtype": "Dynamic Link",
+   "in_standard_filter": 1,
+   "label": "Courier",
+   "options": "party_type",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "duty",
+   "fieldtype": "Link",
+   "label": "Duty",
+   "options": "Courier Duty",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_proof",
+   "fieldtype": "Section Break",
+   "label": "Proof"
+  },
+  {
+   "description": "Photo or signature image. Empty for an OTP proof, and empty while a queued offline upload has not landed yet.",
+   "fieldname": "file",
+   "fieldtype": "Attach",
+   "label": "File"
+  },
+  {
+   "fieldname": "recipient_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Recipient Name",
+   "length": 140
+  },
+  {
+   "fieldname": "column_break_proof",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "When the courier captured this on the handset — NOT when the server received it. The two differ by hours for a proof that was queued offline.",
+   "fieldname": "captured_at",
+   "fieldtype": "Datetime",
+   "label": "Captured At",
+   "reqd": 1
+  },
+  {
+   "description": "Client-generated idempotency key. A retried upload from the offline queue reuses it, so the same tap can never produce two proofs.",
+   "fieldname": "request_id",
+   "fieldtype": "Data",
+   "label": "Request ID",
+   "length": 140,
+   "read_only": 1,
+   "search_index": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "section_break_geo",
+   "fieldtype": "Section Break",
+   "label": "Location"
+  },
+  {
+   "fieldname": "latitude",
+   "fieldtype": "Float",
+   "label": "Latitude",
+   "precision": "6"
+  },
+  {
+   "fieldname": "longitude",
+   "fieldtype": "Float",
+   "label": "Longitude",
+   "precision": "6"
+  },
+  {
+   "fieldname": "column_break_geo",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "GPS accuracy radius in metres, as reported by the handset.",
+   "fieldname": "accuracy_m",
+   "fieldtype": "Float",
+   "label": "Accuracy (m)",
+   "precision": "2"
+  },
+  {
+   "default": "0",
+   "description": "Set when the handset reported a mock location provider. Such a proof is stored but must never be promoted into the address pin consensus.",
+   "fieldname": "is_mocked",
+   "fieldtype": "Check",
+   "in_standard_filter": 1,
+   "label": "Is Mocked"
+  },
+  {
+   "fieldname": "section_break_notes",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "notes",
+   "fieldtype": "Small Text",
+   "label": "Notes"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-08-05 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Jarz Courier",
+ "name": "Delivery Proof",
+ "naming_rule": "By \"Naming Series\" field",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "sales_invoice",
+ "track_changes": 1
+}

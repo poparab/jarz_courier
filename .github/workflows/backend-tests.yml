@@ -1,0 +1,188 @@
+name: Backend Tests
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, develop, "feature/**", "fix/**"]
+    paths:
+      - "jarz_courier/**"
+      - ".github/workflows/backend-tests.yml"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "jarz_courier/**"
+      - ".github/workflows/backend-tests.yml"
+
+# Serialised on the SHARED STAGING VOLUME, not on the ref.
+#
+# The job below syncs the branch under test into the live staging `erp_apps`
+# volume (`git archive HEAD | docker exec ... tar -xf -`) and restores it
+# afterwards with `git checkout -- .`. That volume is a single mutable resource
+# shared by every branch, so a per-ref group (`backend-${{ github.ref }}`) would
+# let two feature branches run at once and interleave writes into the same
+# checkout — each seeing a mixture of the other's files. jarz_pos's workflow was
+# fixed the same way on 2026-08-05; this one is born with the constant group.
+#
+# The group name matches jarz_pos's deliberately, but note it does NOT serialise
+# across the two repositories — GitHub scopes concurrency groups per repo. That
+# is acceptable only because the two workflows write to different directories in
+# the volume (`apps/jarz_pos` vs `apps/jarz_courier`) and each restores its own.
+# The day either one starts writing outside its own app directory, this stops
+# being safe and the two need a real cross-repo lock.
+#
+# cancel-in-progress is deliberately FALSE: runs must QUEUE, not cancel. A
+# cancelled run can die between the sync and the `git checkout -- .` restore,
+# leaving the live staging app directory holding another branch's code.
+concurrency:
+  group: backend-staging-volume
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Logic gate — the pure mock/unittest suite.
+  #
+  # There is no GL-audit job here and there must never be one: jarz_courier posts
+  # no GL. `test_no_gl_writes` is what enforces that, and COURIER_CONTRACTS.md §9
+  # requires it to be listed in the MODULES array below. Do not remove it from
+  # that list to make a red build green — a failure there means money logic has
+  # leaked into an app whose code the GL audit suite does not cover.
+  #
+  # As in jarz_pos, the modules are listed explicitly rather than run via
+  # `--app jarz_courier`: ERPNext v16 runs BootStrapTestData() at import of
+  # erpnext.tests.utils (pulled in by any FrappeTestCase), which collides with the
+  # populated `frontend` master data and fails during test collection. Every module
+  # here is pure unittest + mocks and never imports it. `--skip-before-tests` keeps
+  # ERPNext's destructive before_tests hook (delete from `tabItem Price` + commit)
+  # away from the live clone.
+  # ---------------------------------------------------------------------------
+  logic-tests:
+    name: Logic tests (mock/unittest suite)
+    runs-on: [self-hosted, staging-docker]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve backend container
+        id: backend-container
+        shell: bash
+        run: |
+          container_name="$(docker ps --format '{{.Names}}' | grep -E '^erp[-_]backend[-_][0-9]+$' | head -1)"
+          if [ -z "$container_name" ]; then
+            echo "Could not find an ERPNext backend container. Expected erp-backend-1 or erp_backend_1."
+            docker ps --format 'table {{.Names}}\t{{.Status}}'
+            exit 1
+          fi
+          echo "name=$container_name" >> "$GITHUB_OUTPUT"
+
+      # jarz_courier may not be installed on the staging site yet.
+      # `deploy_backend.ps1` has NO `bench install-app` anywhere — only backup,
+      # migrate, clear-cache — and `bench migrate` will not create a new app's
+      # DocTypes (COURIER_APP_SPEC.md §7). Until an idempotent bootstrap lands,
+      # this step fails the run with the actual reason rather than letting
+      # `bench run-tests --app jarz_courier` die with an opaque error 20 lines
+      # into the log.
+      - name: Assert the app is installed on the site
+        env:
+          CONTAINER: ${{ steps.backend-container.outputs.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! docker exec "${CONTAINER}" bench --site frontend list-apps | grep -qw jarz_courier; then
+            echo "jarz_courier is not installed on site 'frontend'."
+            echo "Run: bench --site frontend install-app jarz_courier"
+            echo "(deploy_backend.ps1 does not do this — see COURIER_APP_SPEC.md §7.)"
+            docker exec "${CONTAINER}" bench --site frontend list-apps
+            exit 1
+          fi
+
+      # ── Sync branch code into the app ──────────────────────────────────────
+      # NEVER `docker cp .` here. /home/frappe/frappe-bench/apps IS the live
+      # `erp_apps` volume, and `docker cp .` copies the runner's ENTIRE checkout —
+      # `.git` included — over the live repo. That transplanted CI's git state onto
+      # staging: a depth-1 shallow clone whose HEAD was the tip of main, plus an
+      # actions/checkout `http.…extraheader` AUTHORIZATION token left in the volume.
+      #
+      # The fallout (found 2026-07-15) was a systemic false-green. deploy_backend.ps1
+      # gates every step on `HeadBefore -ne RemoteHead`; CI had already moved on-disk
+      # HEAD to the deploy's target commit, so the deploy computed DEPLOY_REQUIRED=false
+      # and skipped pip/migrate/cache-clear/restart while reporting success. gunicorn
+      # runs with --preload, so the code only loads at master start: the new code sat
+      # on disk and never ran. Staging served code two commits stale, green all the way.
+      #
+      # `git archive HEAD` exports exactly the tracked tree at this commit — no `.git`,
+      # no untracked junk, no token — so the live repo's git state is left untouched
+      # and the deploy's change detection stays meaningful.
+      #
+      # Extracting via `docker exec` (not `docker cp`) also drops CI's root privilege:
+      # `docker cp` runs through the daemon as root and bypasses file permissions
+      # entirely, which is how it stamped the runner's uid 1001 across the volume.
+      # `docker exec` runs as `frappe` (uid 1000 = host `ubuntu`), so CI can only write
+      # what it legitimately owns. This REQUIRES the volume to be owned by uid 1000 —
+      # if this step dies with "Cannot open: Permission denied", the app dir is still
+      # uid 1001 and needs `sudo chown -R ubuntu:ubuntu` once (see the remediation text
+      # in deploy_backend.ps1's Assert-AppRepoIntegrity).
+      #
+      # Known limitation: tar adds and overwrites but never deletes, so a file the
+      # deployed commit has and this branch removed stays on disk for the test run.
+      # The restore below puts tracked files back.
+      - name: Sync branch code into the app (so tests run against this checkout)
+        env:
+          CONTAINER: ${{ steps.backend-container.outputs.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git archive --format=tar HEAD \
+            | docker exec -i "${CONTAINER}" tar -xf - -C /home/frappe/frappe-bench/apps/jarz_courier
+
+      - name: Run mock/unittest logic suite (safe, non-destructive vs frontend)
+        env:
+          CONTAINER: ${{ steps.backend-container.outputs.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODULES=(
+            test_no_gl_writes
+            test_courier_onboarding
+            test_run_sheet
+            test_api_device
+            test_api_duty
+            test_api_run
+            test_api_pod
+            test_api_statement
+          )
+          rc=0
+          for m in "${MODULES[@]}"; do
+            echo "::group::${m}"
+            docker exec "${CONTAINER}" bench --site frontend run-tests \
+              --app jarz_courier --module "jarz_courier.tests.${m}" --skip-before-tests --failfast || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
+        timeout-minutes: 15
+
+      # Undo the branch-code sync so staging's worktree matches its deployed commit
+      # again (the test run only needed the branch code transiently).
+      #
+      # It deliberately does NOT swallow errors with `|| true`. Failing loudly
+      # matters: a silent restore failure leaves branch code on the live volume,
+      # which is exactly what deploy_backend.ps1's integrity guard refuses to
+      # deploy over.
+      - name: Restore deployed app code on the runner host
+        if: ${{ always() }}
+        env:
+          CONTAINER: ${{ steps.backend-container.outputs.name }}
+          APP_DIR: /home/frappe/frappe-bench/apps/jarz_courier
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Tracked files only. Deliberately NOT `git clean` — an untracked directory
+          # whose contents are all gitignored (e.g. a dir holding only __pycache__) is
+          # hidden by `git status` but still listed by `git clean -nd`, and whether
+          # `-d` actually removes it varies by git version. Against a live production
+          # clone that ambiguity isn't worth it; `checkout -- .` restores the deployed
+          # code, which is the property that matters. Any file the branch adds and the
+          # deployed commit lacks is left as an inert untracked file, which is why the
+          # deploy guard checks tracked files (-uno) rather than untracked ones.
+          docker exec "${CONTAINER}" git -c safe.directory="${APP_DIR}" -C "${APP_DIR}" checkout -- .
+          echo "Restored worktree to deployed commit:"
+          docker exec "${CONTAINER}" git -c safe.directory="${APP_DIR}" -C "${APP_DIR}" status -sb -uno

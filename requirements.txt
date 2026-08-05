@@ -1,0 +1,12 @@
+# Jarz Courier Dependencies
+#
+# Intentionally empty of third-party packages: this app is transport + doctypes
+# only, and every piece of money logic it needs is called on jarz_pos.
+#
+# If you add a runtime dependency, add it to BOTH this file and pyproject.toml.
+# deploy_backend.ps1 keys its editable-reinstall step off a diff in these two
+# files, so a package listed in only one of them never gets installed on the
+# server and the failure shows up as an ImportError in a worker, not at deploy.
+#
+# frappe / erpnext / jarz_pos are installed and managed by bench (see the
+# `required_apps` declaration in jarz_courier/hooks.py).

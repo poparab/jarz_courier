@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# Frappe build artifacts
+assets/
+*.log
+frappe-bench/
+
+# Node
+node_modules/
+
+# Editor
+.vscode/
+*.swp
+
+# Backup files
+*~
+*.bak
+*.tmp
+
+# OS specific files
+.DS_Store
+Thumbs.db
+Desktop.ini
