@@ -395,13 +395,56 @@ def _handle_mocked(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def branch_positions(branch: str) -> Dict[str, Any]:
-    """Live positions for one branch, newest first. Read-only, Redis only.
+    """Live positions for one branch, newest first.
 
-    No database query at all, on purpose: the ops board polls this as a fallback for
-    the realtime feed, so it has to be cheap enough to call every few seconds without
-    anybody thinking about it.
+    Positions come from Redis; the ops board polls this as a fallback for the
+    realtime feed, so it has to stay cheap enough to call every few seconds
+    without anybody thinking about it.
+
+    The one exception to "Redis only" is the courier's display name. Redis holds
+    ``party`` — an Employee id like ``HR-EMP-000007`` — because that is what the
+    ping carries and denormalising a name onto every ping would let it go stale
+    the moment somebody is renamed. But a map of employee ids is unusable: a
+    dispatcher deciding who to call needs to read "سعيد حمدي", not a primary key.
+    So the names are resolved here, once per refresh, in a single indexed query
+    over the handful of couriers actually on the branch — not per position, and
+    not on the ping path.
+
+    Fails open: an unresolvable name leaves the id in place rather than dropping
+    the courier off the map. A marker labelled with an id is worse than a name and
+    better than a missing courier.
     """
     positions = location_cache.read_branch_positions(branch)
+
+    employee_ids = []
+    for position in positions:
+        if str(position.get("party_type") or "") == "Employee":
+            party = str(position.get("party") or "").strip()
+            if party and party not in employee_ids:
+                employee_ids.append(party)
+
+    names: Dict[str, str] = {}
+    if employee_ids:
+        try:
+            for row in frappe.get_all(
+                "Employee",
+                filters={"name": ["in", employee_ids]},
+                fields=["name", "employee_name"],
+                limit_page_length=0,
+            ) or []:
+                label = str(row.get("employee_name") or "").strip()
+                if label:
+                    names[row["name"]] = label
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(), "jarz_courier: courier name lookup failed"
+            )
+
+    for position in positions:
+        party = str(position.get("party") or "").strip()
+        # `courier_name` specifically: it is the key the ops board already reads.
+        position["courier_name"] = names.get(party) or party
+
     return {
         "branch": branch,
         "as_of": str(now_datetime()),
