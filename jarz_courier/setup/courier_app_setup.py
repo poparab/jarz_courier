@@ -54,6 +54,23 @@ _DOCTYPE_PERMISSIONS: Dict[str, List[Dict[str, object]]] = {
         {"role": "JARZ Manager", "read": 1, "write": 1, "create": 1, "delete": 1, "report": 1},
         {"role": "jarz line manager", "read": 1, "write": 1, "report": 1},
     ],
+    "Courier Run": [
+        # A run is a record ABOUT the courier, written by the server. They get read
+        # only: nothing in the app asks a courier to edit their own distance, and a
+        # writable polyline is a distance a courier can choose.
+        {"role": COURIER_ROLE, "read": 1},
+        {"role": "JARZ Manager", "read": 1, "write": 1, "delete": 1, "report": 1, "export": 1},
+        {"role": "jarz line manager", "read": 1, "report": 1},
+    ],
+    "Courier Anomaly": [
+        # Couriers get NOTHING here, not even read, and that is a considered choice
+        # rather than an oversight. A finding is a prompt for a manager to go and ask a
+        # question; a courier who can watch the detector's output learns which
+        # thresholds to stay under, and a courier who cannot is simply asked about their
+        # day. Transparency belongs in that conversation, not in a table they can poll.
+        {"role": "JARZ Manager", "read": 1, "write": 1, "delete": 1, "report": 1, "export": 1},
+        {"role": "jarz line manager", "read": 1, "write": 1, "report": 1},
+    ],
 }
 
 _PERM_FLAGS = ("read", "write", "create", "delete", "submit", "cancel", "amend", "report", "export", "share", "print", "email")

@@ -12,9 +12,10 @@ Mirrors the pattern used across ``jarz_pos/tests`` (see
 
 from __future__ import annotations
 
+import logging
 import sys
 import types
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -80,7 +81,7 @@ def _install_frappe() -> None:
     fake.whitelist = whitelist
     fake.session = SimpleNamespace(user="courier@example.com")
     fake.flags = SimpleNamespace()
-    fake.local = SimpleNamespace()
+    fake.local = SimpleNamespace(conf={}, cache={})
     fake.log_error = lambda *a, **k: None
     fake.get_traceback = lambda *a, **k: ""
     fake.get_roles = lambda *a, **k: []
@@ -90,6 +91,18 @@ def _install_frappe() -> None:
     fake.new_doc = _unstubbed("new_doc")
     fake.get_meta = _unstubbed("get_meta")
     fake.get_cached_value = _unstubbed("get_cached_value")
+    # A real logger, silenced. The tracking/anomaly modules call `.setLevel()` on
+    # whatever this returns and then log through it, so a SimpleNamespace would fail
+    # on the first attribute the logging API needs. Silencing it keeps a passing suite
+    # quiet without hiding the calls from a test that wants to assert on them.
+    _test_logger = logging.getLogger("jarz_courier.tests")
+    _test_logger.addHandler(logging.NullHandler())
+    _test_logger.propagate = False
+    fake.logger = lambda *a, **k: _test_logger
+    # Deliberately unstubbed: every Redis interaction must be patched by the test that
+    # needs it. A permissive fake cache would let a test pass while the real key shape
+    # — which crosses an app boundary — was wrong.
+    fake.cache = _unstubbed("cache")
     fake.db = SimpleNamespace(
         get_value=_unstubbed("db.get_value"),
         set_value=_unstubbed("db.set_value"),
@@ -134,6 +147,15 @@ def _install_frappe() -> None:
             return value
         return date.fromisoformat(str(value)[:10])
 
+    def add_to_date(value: Any = None, **kwargs: Any):
+        base = get_datetime(value) if value not in (None, "") else datetime.now()
+        allowed = {"days", "hours", "minutes", "seconds", "weeks"}
+        delta = timedelta(**{k: v for k, v in kwargs.items() if k in allowed})
+        return base + delta
+
+    def time_diff_in_seconds(later: Any, earlier: Any) -> float:
+        return (get_datetime(later) - get_datetime(earlier)).total_seconds()
+
     utils.flt = flt
     utils.cint = cint
     utils.now_datetime = lambda: datetime.now()
@@ -141,6 +163,8 @@ def _install_frappe() -> None:
     utils.nowdate = lambda: date.today().isoformat()
     utils.get_datetime = get_datetime
     utils.getdate = getdate
+    utils.add_to_date = add_to_date
+    utils.time_diff_in_seconds = time_diff_in_seconds
     sys.modules["frappe.utils"] = utils
     fake.utils = utils
 

@@ -1,0 +1,294 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "naming_series:",
+ "creation": "2026-08-08 00:00:00.000000",
+ "description": "One tracked run. Holds ONE encoded polyline for the whole run instead of one row per GPS ping — pings live in Redis and are summarised here exactly once, when the run closes.",
+ "doctype": "DocType",
+ "editable_grid": 0,
+ "engine": "InnoDB",
+ "field_order": [
+  "naming_series",
+  "party_type",
+  "party",
+  "branch",
+  "column_break_head",
+  "status",
+  "started_on",
+  "ended_on",
+  "section_break_context",
+  "duty",
+  "column_break_context",
+  "device",
+  "section_break_live",
+  "last_ping_on",
+  "last_latitude",
+  "last_longitude",
+  "column_break_live",
+  "ping_count",
+  "mock_ping_count",
+  "stale_alert_on",
+  "section_break_path",
+  "polyline",
+  "column_break_path",
+  "total_distance_m",
+  "planned_distance_m",
+  "point_count",
+  "column_break_path_2",
+  "dropped_point_count",
+  "truncated_point_count",
+  "stops_delivered",
+  "section_break_review",
+  "anomalies_checked_on",
+  "notes"
+ ],
+ "fields": [
+  {
+   "default": "CRUN-.#####",
+   "fieldname": "naming_series",
+   "fieldtype": "Select",
+   "label": "Series",
+   "options": "CRUN-.#####",
+   "reqd": 1
+  },
+  {
+   "fieldname": "party_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Party Type",
+   "options": "\nEmployee\nSupplier",
+   "reqd": 1
+  },
+  {
+   "fieldname": "party",
+   "fieldtype": "Dynamic Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Courier",
+   "options": "party_type",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "description": "POS Profile name. The same value that must appear on the courier's Employee.branch — it is also the {branch} segment of the courier:loc:{branch}:{party} cache key.",
+   "fieldname": "branch",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Branch",
+   "options": "POS Profile",
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "column_break_head",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "Open",
+   "description": "Abandoned means the watchdog closed it: no ping for hours and nobody ended the duty. Kept distinct from Closed so a force-stopped app does not look like a normal end of day.",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Status",
+   "options": "Open\nClosed\nAbandoned",
+   "reqd": 1
+  },
+  {
+   "fieldname": "started_on",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Started On",
+   "reqd": 1
+  },
+  {
+   "fieldname": "ended_on",
+   "fieldtype": "Datetime",
+   "label": "Ended On"
+  },
+  {
+   "fieldname": "section_break_context",
+   "fieldtype": "Section Break",
+   "label": "Context"
+  },
+  {
+   "fieldname": "duty",
+   "fieldtype": "Link",
+   "label": "Duty",
+   "options": "Courier Duty",
+   "search_index": 1
+  },
+  {
+   "fieldname": "column_break_context",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "device",
+   "fieldtype": "Link",
+   "label": "Device",
+   "options": "Courier Device",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_live",
+   "fieldtype": "Section Break",
+   "label": "Live"
+  },
+  {
+   "description": "Handset time of the newest accepted fix, written at most once a minute. This is what the stale-ping watchdog reads — the Redis position key expires, so it cannot be the watchdog's source.",
+   "fieldname": "last_ping_on",
+   "fieldtype": "Datetime",
+   "label": "Last Ping On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_latitude",
+   "fieldtype": "Float",
+   "label": "Last Latitude",
+   "precision": "6",
+   "read_only": 1
+  },
+  {
+   "fieldname": "last_longitude",
+   "fieldtype": "Float",
+   "label": "Last Longitude",
+   "precision": "6",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_live",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Fixes accepted into the trail. Not the number the client sent — noise-filtered and mocked fixes are excluded.",
+   "fieldname": "ping_count",
+   "fieldtype": "Int",
+   "label": "Ping Count",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "description": "Fixes the handset itself flagged as coming from a mock location provider. Non-zero is worth a conversation; these never reach the trail, so they cannot affect distance.",
+   "fieldname": "mock_ping_count",
+   "fieldtype": "Int",
+   "label": "Mock Ping Count",
+   "read_only": 1
+  },
+  {
+   "fieldname": "stale_alert_on",
+   "fieldtype": "Datetime",
+   "label": "Stale Alert On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_path",
+   "fieldtype": "Section Break",
+   "label": "Path"
+  },
+  {
+   "description": "Google encoded polyline, precision 5. Written exactly once, when the run closes. There is no precision marker inside the string, so a reader assuming 6 will draw a line across the ocean.",
+   "fieldname": "polyline",
+   "fieldtype": "Long Text",
+   "label": "Polyline",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_path",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Sum of great-circle hops over the NOISE-FILTERED track: accuracy > 50 m dropped, movement < 20 m dropped as drift, implied speed > 120 km/h rejected. Without that filter a parked handset's jitter adds kilometres nobody rode.",
+   "fieldname": "total_distance_m",
+   "fieldtype": "Float",
+   "in_list_view": 1,
+   "label": "Actual Distance (m)",
+   "precision": "2",
+   "read_only": 1
+  },
+  {
+   "description": "Straight-line chain from where the run started through each delivered stop's address pin, in delivery order. The denominator of the detour ratio. 0 means it could not be computed (too few pinned stops).",
+   "fieldname": "planned_distance_m",
+   "fieldtype": "Float",
+   "label": "Planned Distance (m)",
+   "precision": "2",
+   "read_only": 1
+  },
+  {
+   "fieldname": "point_count",
+   "fieldtype": "Int",
+   "label": "Points Kept",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_path_2",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Fixes the noise filter discarded when the polyline was built.",
+   "fieldname": "dropped_point_count",
+   "fieldtype": "Int",
+   "label": "Points Dropped",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "description": "Oldest fixes evicted by the trail cap before the run closed. Non-zero means the polyline is incomplete at its start and the distance understates the run.",
+   "fieldname": "truncated_point_count",
+   "fieldtype": "Int",
+   "label": "Points Truncated",
+   "read_only": 1
+  },
+  {
+   "fieldname": "stops_delivered",
+   "fieldtype": "Int",
+   "label": "Stops Delivered",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_review",
+   "fieldtype": "Section Break",
+   "label": "Review"
+  },
+  {
+   "description": "Set once the anomaly detector has looked at this run, so a repeated pass does not re-scan it.",
+   "fieldname": "anomalies_checked_on",
+   "fieldtype": "Datetime",
+   "label": "Anomalies Checked On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "notes",
+   "fieldtype": "Small Text",
+   "label": "Notes"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-08-08 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Jarz Courier",
+ "name": "Courier Run",
+ "naming_rule": "By \"Naming Series\" field",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "party",
+ "track_changes": 0
+}

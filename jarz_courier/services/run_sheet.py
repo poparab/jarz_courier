@@ -243,6 +243,17 @@ def _display_id(row: Dict[str, Any]) -> str:
     return str(value) if value > 0 else str(row.get("name") or "")
 
 
+def load_address_pins(rows: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Public entry point to the batch address loader below.
+
+    Exists so ``services/courier_run`` (which needs stop pins to compute a planned
+    route) can share this one meta-guarded query instead of writing a second one.
+    Two loaders would mean two places to remember that the geo fields are jarz_pos
+    lane A4 and may not exist yet on a given site.
+    """
+    return _load_addresses(rows)
+
+
 def _load_addresses(rows: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """Batch-load the addresses for a run in one query.
 

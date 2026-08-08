@@ -68,10 +68,40 @@ doc_events = {}
 # Scheduled Tasks
 # ---------------
 #
-# None in P1. The consensus-pin clustering job (spec module B5) lands in P2 and
-# will call `jarz_pos.services.geo_resolution` rather than writing Address
-# fields itself.
-scheduler_events = {}
+# EVERY handler below is a `scheduled_*` wrapper that swallows its own exceptions.
+# That is not defensive style for its own sake: a scheduler job that raises writes a
+# traceback into the Scheduled Job Log on every tick, and Frappe disables a job after
+# repeated failures — which would silently switch a whole feature off. The wrappers
+# also isolate the stages from each other, so one broken detector cannot take the
+# stale-ping watchdog down with it.
+#
+# Cadence reasoning:
+#
+# * `assignment_watch` every 2 minutes. This is a POLL, and it is a poll because
+#   there is no legal alternative on this side of the boundary: assignment happens in
+#   jarz_pos, `hooks.doc_events` on Sales Invoice is forbidden here (see below), and
+#   contract §9 makes the dependency one-way so jarz_pos cannot call in. Two minutes
+#   is the latency price of that isolation. See `services/assignment_watch`.
+# * `anomaly.scheduled_detect` every 5 minutes, driven by the STALE-PING WATCHDOG
+#   inside it — a 20-minute silence should be noticed in minutes, not hours. The
+#   heavier per-run and per-proof passes ride along on the same tick; they are
+#   idempotent (unique `dedupe_key`) so re-scanning an overlapping window is free.
+# * `consensus_pin` daily. Promoting an Address pin needs several deliveries to the
+#   same door, which accumulate over weeks — running it more often would just re-read
+#   the same proofs and find the same answer.
+scheduler_events = {
+    "cron": {
+        "*/2 * * * *": [
+            "jarz_courier.services.assignment_watch.scheduled_sweep",
+        ],
+        "*/5 * * * *": [
+            "jarz_courier.services.anomaly.scheduled_detect",
+        ],
+    },
+    "daily_long": [
+        "jarz_courier.services.consensus_pin.scheduled_promote",
+    ],
+}
 
 
 # Ensure API modules are imported at startup so @frappe.whitelist() decorators
@@ -122,5 +152,14 @@ try:
     _statement.confirm_deposit
     _statement.reject_deposit
     _statement.list_pending_deposits
+except Exception:
+    pass
+
+try:
+    from jarz_courier.api import tracking as _tracking
+
+    _tracking.ingest_ping
+    _tracking.ingest_pings
+    _tracking.get_live_positions
 except Exception:
     pass

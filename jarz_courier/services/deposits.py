@@ -28,7 +28,7 @@ from frappe import _
 from frappe.utils import flt, now_datetime
 
 from jarz_courier.constants import DEPOSIT_METHODS, DEPOSIT_STATUS, DOCTYPES, QUERY_LIMITS, WS_EVENTS
-from jarz_courier.services import pos_bridge
+from jarz_courier.services import pos_bridge, push
 
 DOCTYPE = DOCTYPES.COURIER_DEPOSIT_DECLARATION
 
@@ -198,6 +198,25 @@ def confirm(*, name: str, confirmed_by: Optional[str] = None) -> Dict[str, Any]:
         },
         [doc.branch] if doc.branch else [],
     )
+
+    # The socket event above only reaches a courier whose app is open, and a courier
+    # who has just handed over cash is usually walking away from the branch with it
+    # shut. The push is their receipt — and it is the artefact they will produce if the
+    # hand-over is later disputed, so a failure to send it must not undo a posting that
+    # already happened.
+    try:
+        push.notify_deposit_confirmed(
+            party_type=doc.party_type,
+            party=doc.party,
+            branch=doc.branch,
+            declaration=doc.name,
+            amount=flt(doc.amount),
+            reference=doc.reference,
+        )
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(), f"jarz_courier: deposit push failed for {doc.name}"
+        )
 
     return {
         "declaration": _as_payload(doc),

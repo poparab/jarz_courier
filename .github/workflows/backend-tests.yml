@@ -149,6 +149,29 @@ jobs:
             test_api_run
             test_api_pod
             test_api_statement
+            # ── Tracking, notifications, anomalies, consensus pins (B5/B7/B8/B9) ──
+            # test_geo_track is the one to look at first when a distance, a detour
+            # ratio or a fuel figure looks wrong: it owns the noise filter and the
+            # polyline encoder, and every number downstream inherits both.
+            test_geo_track
+            # Asserts the LITERAL `courier:loc:{branch}:{party}` key and its payload
+            # keys. That key is read by jarz_pos/api/tracking.py across an app
+            # boundary, so it is a wire contract — a rename here breaks a
+            # customer-facing screen and nothing else in this repo would fail.
+            test_location_cache
+            test_tracking
+            test_courier_run
+            # test_anomaly reads the Courier Anomaly DocType JSON and asserts it
+            # declares no monetary field. That is the machine-checkable form of B9's
+            # "flag, do not compute penalties" — do not delete it to unblock a build.
+            test_anomaly
+            # test_consensus_pin asserts this app contains no mutating call on the
+            # Address path (CONTRACTS §3: jarz_courier is not an authorised writer of
+            # the geo fields; every pin write goes through jarz_pos).
+            test_consensus_pin
+            test_push
+            test_assignment_watch
+            test_api_tracking
           )
           rc=0
           for m in "${MODULES[@]}"; do

@@ -33,11 +33,14 @@ from frappe import _
 #: Used to build an actionable error when one is missing rather than surfacing a
 #: bare ``ModuleNotFoundError`` to a courier standing at a customer's door.
 _MODULE_OWNERS = {
+    "jarz_pos.api.notifications": "jarz_pos (Firebase/FCM credentials and readiness)",
     "jarz_pos.services.courier_delivery": "jarz_pos lane A3 (per-invoice courier transitions)",
     "jarz_pos.services.courier_identity": "jarz_pos lane A5 (courier identity resolution)",
     "jarz_pos.services.delivery_handling": "jarz_pos (delivery + settlement primitives)",
+    "jarz_pos.services.geo_resolution": "jarz_pos lane A4 (sole writer of the Address geo fields)",
     "jarz_pos.utils.access_control": "jarz_pos (branch scoping / shift enforcement)",
     "jarz_pos.utils.courier_visibility": "jarz_pos (courier ↔ POS Profile matching)",
+    "jarz_pos.utils.geo": "jarz_pos (the §4 confidence ladder)",
     "jarz_pos.utils.realtime": "jarz_pos (branch-scoped realtime publishing)",
 }
 
@@ -188,6 +191,33 @@ def get_invoice_branch(invoice: Any) -> str:
 # ---------------------------------------------------------------------------
 # Realtime — never `frappe.publish_realtime` (COURIER_CONTRACTS.md §5.7)
 # ---------------------------------------------------------------------------
+
+def resolve_branch_recipients(
+    profiles: Sequence[str],
+    *,
+    extra_users: Optional[Iterable[str]] = None,
+) -> list[str]:
+    """Users assigned to *profiles*. The audience for a branch-scoped alert.
+
+    Needed separately from :func:`publish_to_branches` because a push notification
+    and a websocket event go to the same people by two different transports, and
+    resolving the audience twice with two different rules is how a courier alert
+    reaches half the managers.
+    """
+    try:
+        return list(
+            _call(
+                "jarz_pos.utils.realtime",
+                "resolve_branch_recipients",
+                profiles,
+                extra_users=extra_users,
+            )
+            or []
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier: recipient resolution failed")
+        return []
+
 
 def publish_to_branches(
     event: str,
@@ -382,3 +412,118 @@ def assert_courier_matches_pos_profile(
         )
         or {}
     )
+
+
+# ---------------------------------------------------------------------------
+# Address geo — READ freely, WRITE only through jarz_pos (CONTRACTS §3)
+# ---------------------------------------------------------------------------
+#
+# Contract §3 names exactly two authorised writers of the six Address geo fields,
+# and this app is not one of them. So the consensus-pin job (spec B5) does not
+# write an Address; it asks `geo_resolution.set_address_pin` to, and that function
+# applies the never-downgrade ladder, the manual-override role gate, the
+# "accuracy must never outlive its pin" rule and the "never touch a Woo trigger
+# field" guard. Reimplementing four rules here to save one function call is how
+# the ladder stops being enforceable.
+#
+# For the same reason this app carries NO copy of §4's CONFIDENCE_RANK. Every rank
+# question goes through `confidence_rank` below, so there is nothing local to drift.
+
+
+def set_address_pin(
+    address_name: str,
+    *,
+    latitude: Any,
+    longitude: Any,
+    source: str,
+    accuracy_m: Any = None,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Ask jarz_pos to write a pin. It may refuse, and a refusal is not an error.
+
+    Returns ``{"success": True, "accepted": bool, ...}``. ``accepted=False`` means
+    the address already carries an equal-or-better pin — normal, and the reason the
+    consensus job can run every night without fighting a manager's manual override.
+    """
+    return _call(
+        "jarz_pos.services.geo_resolution",
+        "set_address_pin",
+        address_name,
+        latitude=latitude,
+        longitude=longitude,
+        source=source,
+        accuracy_m=accuracy_m,
+        note=note,
+    )
+
+
+def get_address_geo(address_name: str) -> Dict[str, Any]:
+    """Current geo state of an Address plus its derived ``rank``. Read-only.
+
+    Falsy ``{}`` means "no such Address" — distinct from an Address that exists and
+    has no pin yet, which is the normal first-write case.
+    """
+    return dict(
+        _call("jarz_pos.services.geo_resolution", "get_address_geo", address_name) or {}
+    )
+
+
+def confidence_rank(source: Any) -> int:
+    """Integer rank of a §4 source label. 0 for anything unrecognised.
+
+    Ranks, never string comparison: ``courier_verified`` sorts *below*
+    ``customer_pin`` alphabetically and ``pos_link`` sorts *above*
+    ``manual_override``, so a lexicographic "is this better?" inverts the ladder for
+    two of the five sources — silently.
+    """
+    try:
+        return int(_call("jarz_pos.utils.geo", "confidence_rank", source) or 0)
+    except PosBridgeUnavailable:
+        # Rank is only used to skip addresses that are already good enough. Failing
+        # to that skip-nothing answer costs a wasted evaluation that
+        # `set_address_pin` will reject anyway; guessing a number here could skip an
+        # address that needed the pin.
+        return 0
+
+
+def accuracy_is_known(value: Any) -> bool:
+    """True when an accuracy figure is a real measurement rather than a default.
+
+    Contract §3 requires this question be asked of jarz_pos rather than by
+    comparing the raw number, because ``custom_geo_accuracy_m`` is
+    ``NOT NULL DEFAULT 0`` and 0 therefore means "not reported", not "accurate to
+    0 m". Reading 0 as a tight radius is how "was this delivered near the pin?"
+    reaches a confident wrong answer.
+    """
+    try:
+        return bool(_call("jarz_pos.services.geo_resolution", "accuracy_is_known", value))
+    except PosBridgeUnavailable:
+        # The rule is three lines and cannot drift (the column default is fixed by
+        # Frappe, not by policy). Duplicating it as a fallback is safer than letting
+        # a scheduled detector die on a server that is one deploy behind.
+        try:
+            return float(value or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Push readiness — jarz_pos owns the Firebase credentials
+# ---------------------------------------------------------------------------
+
+def ensure_push_ready() -> Dict[str, Any]:
+    """Initialise the Firebase Admin app if needed and report readiness.
+
+    ``health_check_firebase`` is a public jarz_pos endpoint that initialises the
+    SDK as a side effect and returns ``{"ok": bool, "reason": str, ...}``. Calling
+    it means the service-account path resolution, the site-private-files fallback
+    and the once-per-process failure logging all stay in one place — the place that
+    already has tests for them. This app deliberately does not read
+    ``fcm_service_account_path`` itself; two resolvers for one credential is how
+    push works in one worker and not another.
+    """
+    try:
+        return dict(_call("jarz_pos.api.notifications", "health_check_firebase") or {})
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier: push readiness check failed")
+        return {"ok": False, "reason": "readiness check failed"}

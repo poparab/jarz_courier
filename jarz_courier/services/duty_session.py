@@ -22,6 +22,7 @@ from frappe import _
 from frappe.utils import flt, now_datetime
 
 from jarz_courier.constants import DEPOSIT_STATUS, DOCTYPES, DUTY_STATUS, INVOICE_STATE
+from jarz_courier.services import courier_run
 
 DOCTYPE = DOCTYPES.COURIER_DUTY
 
@@ -74,7 +75,17 @@ def start_duty(
     """
     existing = get_open_duty(party_type, party)
     if existing:
-        return {"duty": existing, "created": False}
+        return {
+            "duty": existing,
+            "created": False,
+            "run": _open_run(
+                party_type=party_type,
+                party=party,
+                branch=existing.get("branch") or branch,
+                duty=existing.get("name"),
+                device=existing.get("device") or device,
+            ),
+        }
 
     doc = frappe.new_doc(DOCTYPE)
     doc.party_type = party_type
@@ -88,7 +99,37 @@ def start_duty(
     doc.device = device
     doc.insert(ignore_permissions=True)
 
-    return {"duty": _as_payload(doc), "created": True}
+    return {
+        "duty": _as_payload(doc),
+        "created": True,
+        "run": _open_run(
+            party_type=party_type, party=party, branch=branch, duty=doc.name, device=device
+        ),
+    }
+
+
+def _open_run(
+    *, party_type: str, party: str, branch: str, duty: Optional[str], device: Optional[str]
+) -> Optional[str]:
+    """Open (or adopt) the tracked run for this duty. Best-effort.
+
+    Opened here so the courier's first ping has an anchor already waiting, but the
+    ping path can open one too — a courier whose app starts tracking before they tap
+    Start Duty must not lose their track. ``ensure_open_run`` is idempotent and
+    attaches the duty to a run that a ping created earlier, so the two entry points
+    converge on one run rather than racing to create two.
+
+    Wrapped: a tracking failure must never stop a courier starting their shift. Cash
+    reconciliation, the run sheet and proof of delivery all work with no run at all.
+    """
+    try:
+        result = courier_run.ensure_open_run(
+            party_type=party_type, party=party, branch=branch, duty=duty, device=device
+        )
+        return (result.get("run") or {}).get("name")
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier: could not open tracked run")
+        return None
 
 
 def end_duty(
@@ -123,7 +164,32 @@ def end_duty(
         doc.notes = notes
     doc.save(ignore_permissions=True)
 
-    return {"duty": _as_payload(doc), "changed": True, "summary": summarize_duty(doc)}
+    return {
+        "duty": _as_payload(doc),
+        "changed": True,
+        "summary": summarize_duty(doc),
+        "runs": _close_runs(party_type, party),
+    }
+
+
+def _close_runs(party_type: str, party: str) -> List[Dict[str, Any]]:
+    """Close the tracked run(s) so the day's polyline gets written. Best-effort.
+
+    This is the **cold path trigger**: closing a run is what turns thousands of Redis
+    fixes into one encoded polyline and one distance on one row, and it is also what
+    lets the anomaly detectors see the raw trail while it still exists.
+
+    Wrapped because it must never block End Duty. A courier standing in a depot at the
+    end of a shift needs their duty closed and their cash reconciled; a polyline that
+    failed to encode is recoverable — the run stays Open, the stale-ping watchdog
+    closes it as Abandoned within a few hours, and the trail survives in Redis for 12.
+    Refusing to close the duty over it would strand the reconciliation instead.
+    """
+    try:
+        return courier_run.close_open_runs(party_type, party)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier: could not close tracked run")
+        return []
 
 
 def summarize_duty(duty: Any) -> Dict[str, Any]:
