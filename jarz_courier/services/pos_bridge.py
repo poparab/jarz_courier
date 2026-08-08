@@ -105,14 +105,31 @@ def resolve_courier_identity(user: Optional[str] = None) -> Dict[str, Any]:
     if not resolved_user or resolved_user == "Guest":
         frappe.throw(_("Not signed in"), frappe.PermissionError)
 
+    # ``ensure_courier_party``, not ``resolve_courier_identity``. The latter name
+    # was assumed before lane A5 shipped and does not exist; the real module
+    # exposes resolve_courier_party (None when there is no Employee) and
+    # ensure_courier_party (throws instead). We want the throwing one: a login
+    # with no Employee record cannot have a run, and returning an empty identity
+    # would surface as an inexplicably blank run sheet rather than the actual
+    # cause, which is that nobody set Employee.user_id.
+    #
+    # The mismatch cost nothing only because _call() raises PosBridgeUnavailable
+    # for a missing attribute and the fallback below answers the same question.
+    # It still meant every call logged a spurious "server out of date" warning.
     try:
         identity = _call(
             "jarz_pos.services.courier_identity",
-            "resolve_courier_identity",
+            "ensure_courier_party",
             user=resolved_user,
         )
         if identity:
-            return dict(identity)
+            # jarz_pos returns the Employee row; party_type is implicit there
+            # because only an Employee can hold a login (a 3PL Supplier courier
+            # has none), but this app's callers read party_type explicitly.
+            resolved = dict(identity)
+            resolved.setdefault("party_type", "Employee")
+            resolved.setdefault("party", resolved.get("name") or "")
+            return resolved
     except PosBridgeUnavailable:
         pass
 

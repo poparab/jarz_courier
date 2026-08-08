@@ -127,21 +127,39 @@ def get_run(
         "custom_kanban_profile": ["in", branch_list],
     }
 
-    order_by = "posting_date asc, creation asc"
-    if "custom_delivery_sequence" in fields:
-        # 0 means "unsequenced" (contract §2), which must sort last, not first.
-        order_by = (
-            "CASE WHEN IFNULL(custom_delivery_sequence, 0) = 0 THEN 1 ELSE 0 END asc, "
-            "custom_delivery_sequence asc, creation asc"
-        )
-
+    # Ordered in Python, not SQL.
+    #
+    # The rule is that 0 means "unsequenced" (contract §2) and must sort LAST,
+    # not first — which in SQL wants a CASE expression. Frappe rejects one
+    # outright:
+    #
+    #   Invalid field format in Order By: CASE WHEN IFNULL(custom_delivery_...
+    #   Use 'field', 'link_field.field', or 'child_table.field'.
+    #
+    # get_all() validates order_by against a field-name grammar precisely to stop
+    # SQL reaching the ORDER BY clause, so there is no phrasing of this that gets
+    # through. Sorting after the fetch is correct here anyway: a run is one
+    # courier's stops for one day — tens of rows, already bounded by `limit` — so
+    # there is nothing to gain from pushing it into the database.
     rows = frappe.get_all(
         "Sales Invoice",
         filters=filters,
         fields=fields,
-        order_by=order_by,
+        order_by="posting_date asc, creation asc",
         limit=limit,
     ) or []
+
+    if "custom_delivery_sequence" in fields:
+        def _sequence_key(row):
+            try:
+                seq = int(row.get("custom_delivery_sequence") or 0)
+            except (TypeError, ValueError):
+                seq = 0
+            # (1, 0) for unsequenced pushes them after every sequenced stop while
+            # keeping their relative posting_date/creation order from the query.
+            return (1, 0) if seq <= 0 else (0, seq)
+
+        rows = sorted(rows, key=_sequence_key)
 
     address_map = _load_addresses(rows)
     stops = [_stop_summary(row, address_map) for row in rows]
