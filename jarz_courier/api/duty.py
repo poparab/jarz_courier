@@ -167,6 +167,35 @@ def get_duty_summary(duty: Optional[str] = None) -> Dict[str, Any]:
         return {"success": False, "error": str(exc)}
 
 
+@frappe.whitelist(allow_guest=False)
+def get_active_duty() -> Dict[str, Any]:
+    """The caller's currently-open duty, or ``None``.
+
+    The app calls this on every launch to answer one question before it can
+    render anything: is this courier already on shift? Without it a courier who
+    force-quits mid-run reopens the app with no duty in memory, and either starts
+    a second one or is told to clock in while the foreground service from the
+    first is still pinging.
+
+    ``{"duty": None}`` is a SUCCESS, not an error — "not on shift" is the normal
+    state for most of the day, and returning a failure envelope for it would make
+    the client treat a healthy launch as a broken one.
+
+    Deliberately no summary: this runs on every cold start and the summary walks
+    delivered invoices and declared deposits. Use ``get_duty_summary`` for that.
+    """
+    _ensure_duty_permission()
+    try:
+        identity = courier_onboarding.ensure_courier_setup(action_label="your active duty")
+        row = duty_session.get_open_duty(identity["party_type"], identity["party"])
+        return {"success": True, "duty": row or None}
+    except frappe.PermissionError:
+        raise
+    except Exception as exc:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier get_active_duty failed")
+        return {"success": False, "error": str(exc), "duty": None}
+
+
 def _assert_duty_visible(row: Dict[str, Any], identity: Dict[str, Any]) -> None:
     """Own duty always; someone else's only for a supervisor on the same branch."""
     if row.get("party_type") == identity.get("party_type") and row.get("party") == identity.get("party"):

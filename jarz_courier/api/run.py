@@ -263,3 +263,26 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+@frappe.whitelist(allow_guest=False)
+def get_failure_reasons() -> Dict[str, Any]:
+    """Active failure reasons for the app's "why did this fail?" sheet.
+
+    Exists because the courier app must never hardcode this list. The codes are
+    stored on the invoice and drive what happens next (reschedule / return /
+    cancel), so a stale copy compiled into an APK would keep writing a reason the
+    server has since retired — and an APK cannot be corrected as fast as a
+    DocType row.
+
+    Reads through ``pos_bridge``: the DocType is owned by ``jarz_pos``, and that
+    app decides what "active" means.
+    """
+    _ensure_run_permission()
+    try:
+        return {"success": True, "reasons": pos_bridge.list_failure_reasons()}
+    except frappe.PermissionError:
+        raise
+    except Exception as exc:
+        frappe.log_error(frappe.get_traceback(), "get_failure_reasons failed")
+        return {"success": False, "error": str(exc), "reasons": []}

@@ -527,3 +527,29 @@ def ensure_push_ready() -> Dict[str, Any]:
     except Exception:
         frappe.log_error(frappe.get_traceback(), "jarz_courier: push readiness check failed")
         return {"ok": False, "reason": "readiness check failed"}
+
+
+# ---------------------------------------------------------------------------
+# Failure reasons — owned by jarz_pos, rendered by the courier app
+# ---------------------------------------------------------------------------
+
+def list_failure_reasons() -> list:
+    """Active ``Delivery Failure Reason`` rows, for the app's failure sheet.
+
+    Proxied rather than queried directly. The DocType lives in ``jarz_pos``,
+    which owns what "active" means and what ``next_action`` each code implies —
+    reading the table from here would duplicate that judgement in a second place
+    and let the two drift.
+
+    Degrades to an empty list rather than throwing: a courier who cannot reach
+    the reason list must still be able to open the app and deliver the stops that
+    are going fine. The sheet renders its own "no reasons available" state.
+    """
+    try:
+        rows = _call("jarz_pos.services.courier_delivery", "list_failure_reasons")
+        return list(rows or [])
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(), "jarz_courier: failure reason lookup failed"
+        )
+        return []
