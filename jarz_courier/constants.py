@@ -167,6 +167,12 @@ class ANOMALY_STATUS:
 
 GEO_SOURCE_COURIER_VERIFIED = "courier_verified"
 
+#: The label for a consensus formed *only* from web-build captures. Contract §4
+#: ranks it 35 — above the customer's own pin, below a native capture — because the
+#: browser exposes no mock-location flag, so such evidence is unverifiable by
+#: construction rather than merely unverified.
+GEO_SOURCE_COURIER_WEB = "courier_web"
+
 #: The weakest pin worth comparing a delivery position to. Anything below this on the
 #: ladder (``territory_centroid``, ``pos_link``) describes a district or a viewport,
 #: not a door — measuring a POD against one produces a 2 km "anomaly" for every

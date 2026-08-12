@@ -80,6 +80,28 @@ def find_by_request_id(request_id: Optional[str]) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
+
+#: The only capture platform that lacks mock-GPS evidence.
+CAPTURE_PLATFORM_WEB = "web"
+CAPTURE_PLATFORM_ANDROID = "android"
+
+
+def normalize_capture_platform(value: Any) -> Optional[str]:
+    """Coerce a client-supplied platform label to a stored Select value.
+
+    Only the literal ``"web"`` downgrades a proof. **Anything else — including
+    blank, unknown labels and every pre-existing row — reads as a native
+    capture**, which is what keeps this change backwards-compatible: no historical
+    proof silently loses the rank it was promoted under.
+
+    Deliberately fails towards the *stricter* interpretation of the evidence
+    (native, i.e. mock-checked) rather than the weaker one, because a client that
+    lies here can only ever downgrade its own proof, never upgrade it.
+    """
+    label = str(value or "").strip().lower()
+    return CAPTURE_PLATFORM_WEB if label == CAPTURE_PLATFORM_WEB else CAPTURE_PLATFORM_ANDROID
+
+
 def record_proof(
     *,
     sales_invoice: str,
@@ -93,6 +115,7 @@ def record_proof(
     longitude: Optional[float] = None,
     accuracy_m: Optional[float] = None,
     is_mocked: Any = False,
+    capture_platform: Optional[str] = None,
     duty: Optional[str] = None,
     request_id: Optional[str] = None,
     notes: Optional[str] = None,
@@ -125,6 +148,7 @@ def record_proof(
     doc.longitude = longitude
     doc.accuracy_m = accuracy_m
     doc.is_mocked = 1 if _truthy(is_mocked) else 0
+    doc.capture_platform = normalize_capture_platform(capture_platform)
     doc.request_id = key
     doc.notes = notes
 

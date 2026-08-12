@@ -27,7 +27,11 @@ from jarz_courier.tests import _support
 
 _support.install_stubs()
 
-from jarz_courier.constants import GEO_SOURCE_COURIER_VERIFIED, GEO_SOURCE_CUSTOMER_PIN  # noqa: E402
+from jarz_courier.constants import (  # noqa: E402
+    GEO_SOURCE_COURIER_VERIFIED,
+    GEO_SOURCE_COURIER_WEB,
+    GEO_SOURCE_CUSTOMER_PIN,
+)
 from jarz_courier.services import consensus_pin  # noqa: E402
 
 
@@ -202,6 +206,125 @@ class TestEvaluateCluster(unittest.TestCase):
             [door_fix("INV-1", lat=0, lng=0), door_fix("INV-2", lat=0, lng=0)]
         )
         self.assertFalse(verdict["promote"])
+
+
+
+def web_fix(invoice, **kwargs):
+    """A door fix captured through the browser build."""
+    fix = door_fix(invoice, **kwargs)
+    fix["capture_platform"] = "web"
+    return fix
+
+
+class TestClusterSource(unittest.TestCase):
+    """Which ladder label a cluster earns, and why blank must mean native."""
+
+    def test_a_blank_platform_is_native(self) -> None:
+        """Every proof written before the web build existed has no value here.
+
+        Reading blank as "web" would demote the entire delivery history to rank 35
+        on the day the web app ships — silently, and with no way back.
+        """
+        self.assertEqual(
+            GEO_SOURCE_COURIER_VERIFIED,
+            consensus_pin.cluster_source([door_fix("INV-1"), door_fix("INV-2")]),
+        )
+
+    def test_an_all_web_cluster_earns_the_web_tier(self) -> None:
+        self.assertEqual(
+            GEO_SOURCE_COURIER_WEB,
+            consensus_pin.cluster_source([web_fix("INV-1"), web_fix("INV-2")]),
+        )
+
+    def test_one_native_fix_carries_the_whole_cluster(self) -> None:
+        """The native fix vouches for the point; the rest only corroborate it."""
+        self.assertEqual(
+            GEO_SOURCE_COURIER_VERIFIED,
+            consensus_pin.cluster_source([web_fix("INV-1"), door_fix("INV-2")]),
+        )
+
+    def test_an_unrecognised_label_is_treated_as_native(self) -> None:
+        """A client can only ever downgrade its own proof, never upgrade it."""
+        fix = door_fix("INV-1")
+        fix["capture_platform"] = "ios-native-someday"
+        self.assertEqual(GEO_SOURCE_COURIER_VERIFIED, consensus_pin.cluster_source([fix]))
+
+    def test_the_label_is_case_and_whitespace_insensitive(self) -> None:
+        fix = door_fix("INV-1")
+        fix["capture_platform"] = "  WEB  "
+        self.assertEqual(GEO_SOURCE_COURIER_WEB, consensus_pin.cluster_source([fix]))
+
+
+class TestWebTierPromotion(unittest.TestCase):
+    """A web-only consensus must land at 35 and must not rewrite itself nightly."""
+
+    WEB_MEMBERS = [
+        web_fix("INV-1", party="HR-EMP-1", lat=30.0, lng=31.0),
+        web_fix("INV-2", party="HR-EMP-2", lat=30.0002, lng=31.0),
+    ]
+    NATIVE_MEMBERS = [
+        door_fix("INV-1", party="HR-EMP-1", lat=30.0, lng=31.0),
+        door_fix("INV-2", party="HR-EMP-2", lat=30.0002, lng=31.0),
+    ]
+
+    RANKS = {
+        "territory_centroid": 10,
+        "pos_link": 20,
+        "customer_pin": 30,
+        "courier_web": 35,
+        "courier_verified": 40,
+        "manual_override": 50,
+    }
+
+    def setUp(self) -> None:
+        self.geo = {"rank": 30, "custom_geo_source": "customer_pin"}
+        self.pin_result = {"success": True, "accepted": True}
+
+        for name, impl in (
+            ("get_address_geo", lambda name: self.geo),
+            ("set_address_pin", lambda *a, **k: self.pin_result),
+            ("confidence_rank", lambda source: self.RANKS.get(str(source or ""), 0)),
+        ):
+            patcher = patch.object(consensus_pin.pos_bridge, name, side_effect=impl)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_web_only_consensus_is_written_at_the_web_tier(self) -> None:
+        outcome = consensus_pin._promote_one("ADDR-1", self.WEB_MEMBERS, 40)
+
+        self.assertEqual("promoted", outcome)
+        kwargs = consensus_pin.pos_bridge.set_address_pin.call_args.kwargs
+        self.assertEqual(GEO_SOURCE_COURIER_WEB, kwargs["source"])
+
+    def test_a_web_consensus_does_not_rewrite_an_address_already_at_the_web_tier(self) -> None:
+        """Without this the nightly pass resets custom_geo_verified_on forever.
+
+        The ladder accepts an equal rank, so the write would succeed every night.
+        """
+        self.geo = {"rank": 35, "custom_geo_source": "courier_web"}
+
+        outcome = consensus_pin._promote_one("ADDR-1", self.WEB_MEMBERS, 40)
+
+        self.assertEqual("skipped_already_verified", outcome)
+        consensus_pin.pos_bridge.set_address_pin.assert_not_called()
+
+    def test_a_native_consensus_still_upgrades_an_address_at_the_web_tier(self) -> None:
+        """35 is a floor for web evidence, never a ceiling for native evidence."""
+        self.geo = {"rank": 35, "custom_geo_source": "courier_web"}
+
+        outcome = consensus_pin._promote_one("ADDR-1", self.NATIVE_MEMBERS, 40)
+
+        self.assertEqual("promoted", outcome)
+        kwargs = consensus_pin.pos_bridge.set_address_pin.call_args.kwargs
+        self.assertEqual(GEO_SOURCE_COURIER_VERIFIED, kwargs["source"])
+
+    def test_a_web_consensus_cannot_touch_a_verified_address(self) -> None:
+        self.geo = {"rank": 40, "custom_geo_source": "courier_verified"}
+
+        outcome = consensus_pin._promote_one("ADDR-1", self.WEB_MEMBERS, 40)
+
+        self.assertEqual("skipped_already_verified", outcome)
+        consensus_pin.pos_bridge.set_address_pin.assert_not_called()
 
 
 class TestPromoteOne(unittest.TestCase):

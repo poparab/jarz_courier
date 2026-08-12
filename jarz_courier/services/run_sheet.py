@@ -151,10 +151,7 @@ def get_run(
 
     if "custom_delivery_sequence" in fields:
         def _sequence_key(row):
-            try:
-                seq = int(row.get("custom_delivery_sequence") or 0)
-            except (TypeError, ValueError):
-                seq = 0
+            seq = _coerce_sequence(row.get("custom_delivery_sequence"))
             # (1, 0) for unsequenced pushes them after every sequenced stop while
             # keeping their relative posting_date/creation order from the query.
             return (1, 0) if seq <= 0 else (0, seq)
@@ -196,6 +193,20 @@ def get_stop(*, invoice_id: str) -> Dict[str, Any]:
 # Payload builders
 # ---------------------------------------------------------------------------
 
+def _coerce_sequence(value: Any) -> int:
+    """Stop sequence as an int, or 0 ("unsequenced") for anything unparseable.
+
+    Shared by the sort key and the stop payload deliberately. They used to differ —
+    the sort guarded, the payload called ``int()`` bare — so one hand-edited or
+    half-synced value raised ``ValueError`` and 500'd the entire run sheet for that
+    courier, mid-shift, rather than mis-ordering one stop.
+    """
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _stop_summary(row: Dict[str, Any], address_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     address_name = row.get("shipping_address_name") or row.get("customer_address") or ""
     address = address_map.get(address_name, {})
@@ -210,7 +221,7 @@ def _stop_summary(row: Dict[str, Any], address_map: Dict[str, Dict[str, Any]]) -
         "phone": address.get("phone") or _customer_phone(row.get("customer")),
         "state": row.get("custom_sales_invoice_state"),
         "branch": row.get("custom_kanban_profile") or row.get("pos_profile"),
-        "sequence": int(row.get("custom_delivery_sequence") or 0),
+        "sequence": _coerce_sequence(row.get("custom_delivery_sequence")),
         "territory": row.get("custom_sub_territory") or row.get("territory") or "",
         "address": {
             "name": address_name,

@@ -44,6 +44,7 @@ def upload_proof(
     longitude: Optional[float] = None,
     accuracy_m: Optional[float] = None,
     is_mocked: Any = False,
+    capture_platform: Optional[str] = None,
     request_id: Optional[str] = None,
     notes: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -72,6 +73,7 @@ def upload_proof(
             longitude=_as_float(longitude),
             accuracy_m=_as_float(accuracy_m),
             is_mocked=is_mocked,
+            capture_platform=capture_platform,
             duty=(open_duty or {}).get("name"),
             request_id=request_id,
             notes=notes,

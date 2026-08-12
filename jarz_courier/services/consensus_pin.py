@@ -39,6 +39,7 @@ from frappe.utils import add_to_date, now_datetime
 from jarz_courier.constants import (
     DOCTYPES,
     GEO_SOURCE_COURIER_VERIFIED,
+    GEO_SOURCE_COURIER_WEB,
     QUERY_LIMITS,
 )
 from jarz_courier.services import geo_track, pos_bridge
@@ -197,6 +198,25 @@ def promote_pins(
     return summary
 
 
+
+def cluster_source(members: Sequence[Dict[str, Any]]) -> str:
+    """Which ladder label a cluster of door fixes has earned.
+
+    **Any** native capture in the cluster is enough for ``courier_verified``: that
+    fix was taken by a build that checks ``Position.isMocked``, and the other
+    members only corroborate a point it already vouches for. Only a cluster with
+    no native evidence at all falls back to ``courier_web``.
+
+    Blank counts as native — every proof written before the web build existed has
+    no value here, and demoting the entire delivery history to rank 35 on the day
+    the web app ships would be a silent, unrecoverable data change.
+    """
+    for member in members:
+        if str(member.get("capture_platform") or "").strip().lower() != "web":
+            return GEO_SOURCE_COURIER_VERIFIED
+    return GEO_SOURCE_COURIER_WEB
+
+
 def _promote_one(address_name: str, members: List[Dict[str, Any]], verified_rank: int) -> str:
     """Evaluate one address and, if it qualifies, ask jarz_pos to write the pin."""
     geo = pos_bridge.get_address_geo(address_name)
@@ -222,11 +242,24 @@ def _promote_one(address_name: str, members: List[Dict[str, Any]], verified_rank
         )
         return "insufficient_consensus"
 
+    # The evidence, not the caller, decides the rank. A cluster containing even one
+    # native capture carries mock-GPS evidence and earns courier_verified; a
+    # cluster that is entirely web captures cannot, and settles for courier_web.
+    source = cluster_source(clusters[0])
+    source_rank = pos_bridge.confidence_rank(source)
+
+    # Second short-circuit, for the web tier. The one above only catches addresses
+    # already at courier_verified. Without this, a web-only consensus would rewrite
+    # an address that is *already* at courier_web every single night — the ladder
+    # accepts an equal rank — resetting custom_geo_verified_on forever.
+    if source_rank and int(geo.get("rank") or 0) >= source_rank:
+        return "skipped_already_verified"
+
     result = pos_bridge.set_address_pin(
         address_name,
         latitude=verdict["latitude"],
         longitude=verdict["longitude"],
-        source=GEO_SOURCE_COURIER_VERIFIED,
+        source=source,
         accuracy_m=verdict["accuracy_m"],
         note=(
             f"Courier consensus from {verdict['invoice_count']} deliveries by "
@@ -237,7 +270,7 @@ def _promote_one(address_name: str, members: List[Dict[str, Any]], verified_rank
 
     if result.get("accepted"):
         _logger().info(
-            f"jarz_courier: promoted {address_name} to {GEO_SOURCE_COURIER_VERIFIED} "
+            f"jarz_courier: promoted {address_name} to {source} "
             f"at {verdict['latitude']},{verdict['longitude']} radius={verdict['radius_m']}m "
             f"from {verdict['invoice_count']} deliveries"
         )
@@ -286,6 +319,7 @@ def _candidate_proofs(*, days: int, limit: int) -> List[Dict[str, Any]]:
                 "longitude",
                 "accuracy_m",
                 "captured_at",
+                "capture_platform",
             ],
             order_by="captured_at desc",
             limit=limit,

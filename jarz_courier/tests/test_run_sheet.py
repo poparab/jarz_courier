@@ -106,14 +106,68 @@ class TestOptionalFieldGuarding(unittest.TestCase):
         self.assertNotIn("custom_delivery_sequence", fields)
 
     def test_unsequenced_stops_sort_last_not_first(self) -> None:
-        """Sequence 0 means "unsequenced" (contract §2), not "first stop"."""
+        """Sequence 0 means "unsequenced" (contract §2), not "first stop".
+
+        Asserted on the returned order rather than on the ``order_by`` string,
+        because this sort is deliberately **not** in SQL: the rule needs a CASE
+        expression and ``frappe.get_all`` validates ``order_by`` against a
+        field-name grammar precisely to keep SQL out of the ORDER BY clause, so no
+        phrasing of it gets through. Asserting the SQL would re-freeze a shape the
+        database layer rejects.
+        """
+        rows = [
+            {"name": "INV-UNSEQ", "custom_delivery_sequence": 0},
+            {"name": "INV-THIRD", "custom_delivery_sequence": 3},
+            {"name": "INV-FIRST", "custom_delivery_sequence": 1},
+        ]
         with patch.object(
             run_sheet, "available_invoice_fields", return_value=["name", "custom_delivery_sequence"]
-        ), patch.object(run_sheet.frappe, "get_all", return_value=[]) as get_all:
-            run_sheet.get_run(party_type="Employee", party="HR-EMP-00042", branches=["Dokki"])
+        ), patch.object(run_sheet.frappe, "get_all", return_value=rows):
+            result = run_sheet.get_run(
+                party_type="Employee", party="HR-EMP-00042", branches=["Dokki"]
+            )
 
-        order_by = get_all.call_args.kwargs["order_by"]
-        self.assertIn("custom_delivery_sequence, 0) = 0 THEN 1 ELSE 0 END asc", order_by)
+        self.assertEqual(
+            ["INV-FIRST", "INV-THIRD", "INV-UNSEQ"],
+            [stop["invoice"] for stop in result["stops"]],
+        )
+
+    def test_several_unsequenced_stops_keep_the_query_order(self) -> None:
+        """The fallback ordering is posting_date/creation; the sort must be stable."""
+        rows = [
+            {"name": "INV-A", "custom_delivery_sequence": 0},
+            {"name": "INV-B", "custom_delivery_sequence": 0},
+            {"name": "INV-SEQ", "custom_delivery_sequence": 2},
+        ]
+        with patch.object(
+            run_sheet, "available_invoice_fields", return_value=["name", "custom_delivery_sequence"]
+        ), patch.object(run_sheet.frappe, "get_all", return_value=rows):
+            result = run_sheet.get_run(
+                party_type="Employee", party="HR-EMP-00042", branches=["Dokki"]
+            )
+
+        self.assertEqual(
+            ["INV-SEQ", "INV-A", "INV-B"],
+            [stop["invoice"] for stop in result["stops"]],
+        )
+
+    def test_a_non_numeric_sequence_is_treated_as_unsequenced(self) -> None:
+        """A hand-edited or half-synced value must not raise mid-run."""
+        rows = [
+            {"name": "INV-JUNK", "custom_delivery_sequence": "not a number"},
+            {"name": "INV-SEQ", "custom_delivery_sequence": 1},
+        ]
+        with patch.object(
+            run_sheet, "available_invoice_fields", return_value=["name", "custom_delivery_sequence"]
+        ), patch.object(run_sheet.frappe, "get_all", return_value=rows):
+            result = run_sheet.get_run(
+                party_type="Employee", party="HR-EMP-00042", branches=["Dokki"]
+            )
+
+        self.assertEqual(
+            ["INV-SEQ", "INV-JUNK"],
+            [stop["invoice"] for stop in result["stops"]],
+        )
 
     def test_ordering_falls_back_to_posting_date_without_the_field(self) -> None:
         with patch.object(

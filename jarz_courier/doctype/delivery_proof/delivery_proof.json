@@ -27,6 +27,7 @@
   "column_break_geo",
   "accuracy_m",
   "is_mocked",
+  "capture_platform",
   "section_break_notes",
   "notes"
  ],
@@ -162,6 +163,14 @@
    "label": "Is Mocked"
   },
   {
+   "description": "Which build captured this proof. Blank and \"android\" both mean a native capture, which reports Position.isMocked and therefore carries mock-GPS evidence. \"web\" means the browser build, where geolocator_web exposes no isMocked and iOS has no mock-provider signal at all — such a proof is unverifiable by construction and consensus promotes it at courier_web (35) rather than courier_verified (40). Blank is deliberately treated as android so every pre-existing proof keeps the behaviour it was written under.",
+   "fieldname": "capture_platform",
+   "fieldtype": "Select",
+   "in_standard_filter": 1,
+   "label": "Capture Platform",
+   "options": "\nandroid\nweb"
+  },
+  {
    "fieldname": "section_break_notes",
    "fieldtype": "Section Break"
   },
@@ -173,7 +182,7 @@
  ],
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-08-05 00:00:00.000000",
+ "modified": "2026-08-12 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Jarz Courier",
  "name": "Delivery Proof",
