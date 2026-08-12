@@ -714,6 +714,10 @@ def watch_stale_pings() -> Dict[str, Any]:
     polyline gets written while the trail is still in Redis.
     """
     from jarz_courier.services import push  # local: push imports nothing from here
+    # Also local, and for a stronger reason than push: duty_session imports
+    # courier_run, and courier_run.close_run calls into this module, so a
+    # module-level import here would close an import cycle at load time.
+    from jarz_courier.services import duty_session
 
     alerted = 0
     abandoned = 0
@@ -762,7 +766,19 @@ def watch_stale_pings() -> Dict[str, Any]:
                 frappe.get_traceback(), f"jarz_courier: stale watch failed for {run.get('name')}"
             )
 
-    return {"examined": len(runs), "alerted": alerted, "abandoned": abandoned}
+    # Duties last, and that order matters: end_duty closes any still-open run as
+    # Closed, so sweeping duties first would overwrite the Abandoned verdict the
+    # loop above just recorded and erase the distinction between "the courier
+    # finished" and "the app went dark".
+    duties = duty_session.close_stale_duties(minutes=STALE_ABANDON_MINUTES)
+
+    return {
+        "examined": len(runs),
+        "alerted": alerted,
+        "abandoned": abandoned,
+        "duties_examined": duties.get("examined", 0),
+        "duties_closed": duties.get("closed", 0),
+    }
 
 
 def _silent_minutes(run: Dict[str, Any]) -> float:

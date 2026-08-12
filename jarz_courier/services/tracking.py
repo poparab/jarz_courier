@@ -43,13 +43,14 @@ dates, below. That is a guard, not a measurement.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
 import frappe
 from frappe import _
-from frappe.utils import get_datetime, now_datetime
+from frappe.utils import convert_utc_to_system_timezone, get_datetime, now_datetime
 
 from jarz_courier.constants import (
     ANOMALY_TYPE,
@@ -165,6 +166,101 @@ def _resolve_timestamp(raw: Dict[str, Any], reference_epoch: float):
         ts = str(now_datetime())
 
     return (ts, round(float(epoch), 3))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OwnTracks (external iOS tracker)
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: The only OwnTracks message type that carries a position. The app also emits
+#: ``transition``, ``waypoint``, ``lwt``, ``beacon``, ``card`` and ``cmd`` on the
+#: same endpoint, so the type has to be checked rather than assumed.
+OWNTRACKS_LOCATION_TYPE = "location"
+
+#: OwnTracks reports ``vel`` in km/h. Every ``speed`` in this pipeline is metres
+#: per second and is never converted downstream — ``geo_track`` computes its
+#: speeding thresholds from it directly — so the conversion has to happen here or
+#: a courier doing 30 km/h is recorded doing 108.
+KMH_TO_MS = 1.0 / 3.6
+
+
+def owntracks_to_fix(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Translate one OwnTracks HTTP payload into this pipeline's fix shape.
+
+    Returns ``None`` for any message that is not a location report, which the
+    caller should answer with a 200 — OwnTracks retries a non-2xx forever, and
+    "this was a region transition, not a position" is not an error.
+
+    **Every field has to be renamed.** ``normalise_fix`` is forgiving by design and
+    would accept the raw payload without complaint, which is the trap: it reads
+    ``lat``/``lon`` (so coordinates would work), and then silently defaults
+    everything else. The result is a fix that looks perfectly healthy and is wrong
+    in four ways at once — server clock instead of handset clock, accuracy 0.0
+    meaning "not reported", no heading, and km/h stored as m/s.
+
+    ``is_mocked`` is hard-coded to 0 and that is a **known weakness, not an
+    oversight**: iOS exposes no mock-location signal at any layer, so there is
+    nothing to read. A fix ingested through here is indistinguishable from a
+    genuine one. Address pins captured on the same handset are contained by the
+    ``courier_web`` rank (contract §4); the live trail has no such containment.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("_type") or "").strip().lower() != OWNTRACKS_LOCATION_TYPE:
+        return None
+
+    fix: Dict[str, Any] = {
+        "lat": payload.get("lat"),
+        # `lon`, not `lng`. normalise_fix happens to accept both spellings, but
+        # relying on that would make this mapping silently dependent on a
+        # tolerance in another module.
+        "lng": payload.get("lon"),
+        "is_mocked": 0,
+    }
+
+    # `tst` is unix seconds on the handset's clock. Passing it as `epoch` alone is
+    # not enough: _resolve_timestamp would then find no `ts` and fall back to
+    # str(now_datetime()) for the human-readable half, so `ts` and `epoch` would
+    # disagree — and `ts` is what Courier Run.last_ping_on is stamped from, which
+    # is what the stale-run watchdog reads. OwnTracks buffers while offline, so
+    # that gap is hours, not milliseconds.
+    epoch = _as_float(payload.get("tst"))
+    if epoch is not None:
+        fix["epoch"] = epoch
+        fix["ts"] = _epoch_to_site_datetime_string(epoch)
+
+    accuracy = _as_float(payload.get("acc"))
+    if accuracy is not None:
+        fix["accuracy"] = accuracy
+
+    heading = _as_float(payload.get("cog"))
+    if heading is not None:
+        fix["heading"] = heading
+
+    velocity_kmh = _as_float(payload.get("vel"))
+    if velocity_kmh is not None:
+        fix["speed"] = velocity_kmh * KMH_TO_MS
+
+    return fix
+
+
+def _epoch_to_site_datetime_string(epoch: float) -> Optional[str]:
+    """Unix seconds → the site's local ``YYYY-MM-DD HH:MM:SS``.
+
+    The site's timezone, not UTC and not the server's, because every other
+    datetime this pipeline stores comes from ``now_datetime()``, which is
+    site-local. Mixing the two would put a courier's afternoon two hours before
+    their morning in the same column.
+    """
+    try:
+        utc = datetime.datetime.fromtimestamp(float(epoch), tz=datetime.timezone.utc)
+        return convert_utc_to_system_timezone(utc).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        # A timezone lookup failure must not cost us the position. Returning None
+        # lets _resolve_timestamp fall back to the server clock for the display
+        # string while `epoch` — the value everything sorts and measures on —
+        # stays the handset's.
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

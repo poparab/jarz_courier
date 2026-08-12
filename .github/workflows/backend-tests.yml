@@ -160,6 +160,10 @@ jobs:
             # customer-facing screen and nothing else in this repo would fail.
             test_location_cache
             test_tracking
+            # The OwnTracks ingest path auto-opens a duty, and nothing had ever
+            # closed one. Without this module in the array the closer is untested
+            # and the array is where "untested" becomes invisible.
+            test_stale_duty
             test_courier_run
             # test_anomaly reads the Courier Anomaly DocType JSON and asserts it
             # declares no monetary field. That is the machine-checkable form of B9's

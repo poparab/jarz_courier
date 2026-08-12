@@ -18,8 +18,10 @@ supervisor-only while ``ingest_ping`` is not.
 
 from __future__ import annotations
 
+import ast
 import json
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from jarz_courier.tests import _support
@@ -29,6 +31,7 @@ _support.install_stubs()
 import frappe  # noqa: E402
 
 from jarz_courier.api import tracking as api  # noqa: E402
+from jarz_courier.services import tracking as real_tracking  # noqa: E402
 from jarz_courier.tests._support import COURIER_IDENTITY, COURIER_ROLES, NO_ROLES, SUPERVISOR_ROLES  # noqa: E402
 
 
@@ -44,6 +47,11 @@ class ApiTestCase(unittest.TestCase):
         }
         self.tracking = MagicMock()
         self.tracking.ingest.side_effect = lambda **kwargs: self.ingest_result
+        # `ingest` is mocked because it writes; the OwnTracks mapper is pure, and
+        # mocking it would make every assertion about the mapping vacuous — a
+        # MagicMock is never None, so the non-location guard would look like it
+        # passed while actually never firing.
+        self.tracking.owntracks_to_fix.side_effect = real_tracking.owntracks_to_fix
 
         patches = [
             patch.object(api, "tracking", self.tracking),
@@ -180,6 +188,111 @@ class TestIngestPings(ApiTestCase):
         )
 
 
+
+class TestIngestOwnTracks(ApiTestCase):
+    """The iOS path: OwnTracks posts a bare JSON body, authenticated as the courier."""
+
+    LOCATION = {
+        "_type": "location",
+        "lat": 30.044420,
+        "lon": 31.235712,
+        "tst": 1786000000,
+        "acc": 9,
+        "cog": 12,
+        "vel": 18,
+    }
+
+    def post(self, body, roles=COURIER_ROLES):
+        with self.as_roles(roles), patch.object(api.frappe, "form_dict", dict(body), create=True):
+            return api.ingest_owntracks()
+
+    def test_a_location_report_is_ingested(self) -> None:
+        result = self.post(self.LOCATION)
+
+        self.assertTrue(result["success"])
+        self.tracking.ingest.assert_called_once()
+
+    def test_it_goes_through_ingest_not_the_cache(self) -> None:
+        """The whole point of the shim.
+
+        Writing to location_cache directly would show a dot and silently starve the
+        trail, the Courier Run, the polyline and every anomaly detector.
+        """
+        self.post(self.LOCATION)
+
+        kwargs = self.tracking.ingest.call_args.kwargs
+        self.assertEqual([dict], [type(p) for p in kwargs["pings"]])
+        self.assertEqual("Dokki", kwargs["branch"])
+        self.assertEqual("Employee", kwargs["party_type"])
+
+    def test_the_branch_comes_from_the_server_not_the_body(self) -> None:
+        """OwnTracks is configured by hand, so treat every field as untrusted."""
+        self.post({**self.LOCATION, "branch": "Someone Elses Branch"})
+
+        self.assertEqual("Dokki", self.tracking.ingest.call_args.kwargs["branch"])
+
+    def test_someone_with_no_courier_role_is_refused(self) -> None:
+        with self.assertRaises(api.frappe.PermissionError):
+            self.post(self.LOCATION, roles=NO_ROLES)
+
+    def test_a_non_location_message_is_a_success_with_nothing_stored(self) -> None:
+        """A 4xx here would make OwnTracks retry a region transition forever."""
+        result = self.post({"_type": "transition", "event": "enter"})
+
+        self.assertTrue(result["success"])
+        self.assertEqual(0, result["accepted"])
+        self.assertEqual("transition", result["ignored"])
+        self.tracking.ingest.assert_not_called()
+
+    def test_a_junk_body_does_not_raise(self) -> None:
+        result = self.post({"hello": "world"})
+
+        self.assertTrue(result["success"])
+        self.tracking.ingest.assert_not_called()
+
+    def test_an_open_duty_is_reused_rather_than_reopened(self) -> None:
+        with patch.object(api.duty_session, "start_duty") as start_duty:
+            self.post(self.LOCATION)
+
+        start_duty.assert_not_called()
+        self.assertEqual("CDUTY-1", self.tracking.ingest.call_args.kwargs["duty"])
+
+    def test_a_duty_is_auto_opened_when_there_is_none(self) -> None:
+        """An iPhone courier has no foreground service to bind a shift to.
+
+        Requiring a manual Start Shift would make "he forgot and was invisible all
+        day, with nothing to tell him" the common failure.
+        """
+        with patch.object(api.duty_session, "get_open_duty", return_value=None), patch.object(
+            api.duty_session,
+            "start_duty",
+            return_value={"duty": {"name": "CDUTY-NEW"}, "created": True},
+        ) as start_duty:
+            self.post(self.LOCATION)
+
+        start_duty.assert_called_once()
+        self.assertEqual("CDUTY-NEW", self.tracking.ingest.call_args.kwargs["duty"])
+
+    def test_a_failed_auto_open_still_records_the_position(self) -> None:
+        """Telemetry must not depend on the duty bookkeeping succeeding."""
+        with patch.object(api.duty_session, "get_open_duty", return_value=None), patch.object(
+            api.duty_session, "start_duty", return_value={}
+        ):
+            result = self.post(self.LOCATION)
+
+        self.assertTrue(result["success"])
+        self.assertIsNone(self.tracking.ingest.call_args.kwargs["duty"])
+
+    def test_a_scoping_error_surfaces_as_a_403(self) -> None:
+        with patch.object(
+            api.courier_onboarding,
+            "ensure_courier_setup",
+            side_effect=api.frappe.PermissionError("nope"),
+        ):
+            with self.assertRaises(api.frappe.PermissionError):
+                self.post(self.LOCATION)
+
+
 class TestGetLivePositions(unittest.TestCase):
     def setUp(self) -> None:
         patcher = patch.object(
@@ -236,6 +349,60 @@ class TestGetLivePositions(unittest.TestCase):
         self.assertEqual(api.location_cache.LOCATION_TTL_SEC, result["ttl_seconds"])
 
 
+
+class TestTheOwnTracksRateLimiterIsConfigured(unittest.TestCase):
+    """Structural, because the decorator is a no-op in this harness.
+
+    ``frappe.rate_limiter`` does not exist under the stubs, so ``_frappe_rate_limit``
+    is None and the decorator returns the function untouched. A misconfiguration here
+    is therefore invisible to every behavioural test in this file — and the specific
+    misconfiguration is not "slightly wrong limits", it is an endpoint that errors on
+    100% of requests. Frappe builds the identity as::
+
+        user_key = frappe.form_dict.get(key, "")
+        if key and ip_based: identity = ip + ":" + user_key
+        identity = identity or ip or user_key
+        if not identity: frappe.throw("Either key or IP flag is required.")
+
+    With ``ip_based=False`` and a key OwnTracks does not send, identity is empty and
+    every call throws. Both halves are asserted on the source.
+    """
+
+    #: Fields OwnTracks actually puts in an HTTP location payload. ``tid`` is the only
+    #: stable per-device identifier among them.
+    OWNTRACKS_FIELDS = {
+        "lat", "lon", "tst", "acc", "alt", "batt", "bs", "cog", "rad",
+        "t", "tid", "vac", "vel", "p", "conn", "topic", "inregions", "SSID",
+    }
+
+    def rate_limit_kwargs(self):
+        source = Path(api.__file__).with_suffix(".py").read_text(encoding="utf-8")
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, "id", "") or getattr(node.func, "attr", "")
+            if name == "_frappe_rate_limit":
+                return {kw.arg: kw.value for kw in node.keywords}
+        self.fail("the OwnTracks endpoint has no rate limiter at all")
+
+    def test_it_is_ip_based(self) -> None:
+        ip_based = self.rate_limit_kwargs()["ip_based"]
+        self.assertTrue(
+            isinstance(ip_based, ast.Constant) and ip_based.value is True,
+            "ip_based=False with a body-absent key makes every request throw",
+        )
+
+    def test_the_key_is_a_field_owntracks_actually_sends(self) -> None:
+        key = self.rate_limit_kwargs()["key"]
+        self.assertIsInstance(key, ast.Constant)
+        self.assertIn(
+            key.value,
+            self.OWNTRACKS_FIELDS,
+            f"{key.value!r} never appears in an OwnTracks payload, so the per-device "
+            "half of the identity would always be empty",
+        )
+
+
 class TestEveryEndpointIsWhitelisted(unittest.TestCase):
     """Contract §8: explicit ``@frappe.whitelist(allow_guest=False)`` on every endpoint.
 
@@ -249,10 +416,15 @@ class TestEveryEndpointIsWhitelisted(unittest.TestCase):
     make this test pass vacuously in the environment it was not written for.
     """
 
-    def test_the_three_endpoints_carry_the_decorator(self) -> None:
+    def test_every_endpoint_carries_the_decorator(self) -> None:
         registry = getattr(frappe, "whitelisted", None)
 
-        for endpoint in (api.ingest_ping, api.ingest_pings, api.get_live_positions):
+        for endpoint in (
+            api.ingest_ping,
+            api.ingest_pings,
+            api.ingest_owntracks,
+            api.get_live_positions,
+        ):
             registered = bool(getattr(endpoint, "whitelisted", False))
             if registry is not None and not callable(registry):
                 registered = registered or endpoint in registry

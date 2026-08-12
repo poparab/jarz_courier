@@ -34,6 +34,127 @@ from jarz_courier.services import tracking  # noqa: E402
 NOW = 1786000000.0
 
 
+
+class TestOwnTracksMapping(unittest.TestCase):
+    """Every field is renamed, and the reason each one matters.
+
+    ``normalise_fix`` is forgiving by design, which is exactly what makes an
+    unmapped OwnTracks payload dangerous: it reads ``lat``/``lon``, so coordinates
+    land, and then silently defaults everything else. The result looks like a
+    healthy fix and is wrong four ways at once. A smoke test that only checks "a
+    dot appeared" passes on all four of those bugs, so each is asserted here.
+    """
+
+    def payload(self, **extra):
+        base = {
+            "_type": "location",
+            "lat": 30.044420,
+            "lon": 31.235712,
+            "tst": int(NOW),
+            "acc": 12,
+            "cog": 187,
+            "vel": 36,
+            "batt": 84,
+            "tid": "ab",
+        }
+        base.update(extra)
+        return base
+
+    def test_a_location_report_maps_every_field(self):
+        fix = tracking.owntracks_to_fix(self.payload())
+
+        self.assertAlmostEqual(30.044420, fix["lat"])
+        self.assertAlmostEqual(31.235712, fix["lng"])
+        self.assertEqual(int(NOW), fix["epoch"])
+        self.assertEqual(12, fix["accuracy"])
+        self.assertEqual(187, fix["heading"])
+
+    def test_velocity_is_converted_from_kmh_to_ms(self):
+        """36 km/h is 10 m/s. Unconverted it would read as 36 m/s = 130 km/h.
+
+        Nothing downstream converts, and geo_track derives its speeding thresholds
+        from this number directly, so every courier would look like a speeder.
+        """
+        fix = tracking.owntracks_to_fix(self.payload(vel=36))
+        self.assertAlmostEqual(10.0, fix["speed"], places=6)
+
+    def test_the_handset_clock_is_kept_for_both_epoch_and_ts(self):
+        """`ts` and `epoch` must describe the same instant.
+
+        Passing `tst` as `epoch` alone leaves `_resolve_timestamp` with no `ts`, so
+        it stamps str(now_datetime()) — the SERVER clock — for the display half.
+        Courier Run.last_ping_on comes from `ts`, and the stale-run watchdog reads
+        that, so the two disagreeing means a courier who handed over a buffered
+        morning looks like they just reported.
+        """
+        fix = tracking.owntracks_to_fix(self.payload(tst=int(NOW)))
+
+        self.assertIn("ts", fix)
+        # The harness runs the site in UTC, so `ts` is `epoch` rendered.
+        import datetime as _dt
+
+        expected = _dt.datetime.fromtimestamp(NOW, tz=_dt.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        self.assertEqual(expected, fix["ts"])
+
+    def test_a_missing_accuracy_is_absent_rather_than_zero(self):
+        """0.0 already means "not reported" downstream — do not manufacture it.
+
+        OwnTracks omits optional fields rather than sending zeros, so a key that is
+        simply not there must not become a value that reads as measured.
+        """
+        fix = tracking.owntracks_to_fix(self.payload(acc=None))
+        self.assertNotIn("accuracy", fix)
+
+    def test_non_location_messages_are_refused_for_the_caller_to_200(self):
+        """OwnTracks retries a non-2xx forever, so these cannot be errors."""
+        for message_type in ("transition", "waypoint", "lwt", "beacon", "card", "cmd"):
+            with self.subTest(message_type=message_type):
+                self.assertIsNone(
+                    tracking.owntracks_to_fix(self.payload(_type=message_type))
+                )
+
+    def test_a_missing_or_junk_type_is_refused(self):
+        for payload in ({}, {"_type": ""}, {"_type": None}, "not a dict", None):
+            with self.subTest(payload=payload):
+                self.assertIsNone(tracking.owntracks_to_fix(payload))
+
+    def test_the_type_check_is_case_insensitive(self):
+        self.assertIsNotNone(tracking.owntracks_to_fix(self.payload(_type="Location")))
+
+    def test_is_mocked_is_always_zero_because_ios_cannot_report_it(self):
+        """Documented weakness, asserted so nobody later reads it as a guarantee."""
+        fix = tracking.owntracks_to_fix(self.payload())
+        self.assertEqual(0, fix["is_mocked"])
+
+    def test_a_mapped_payload_survives_normalise_fix_intact(self):
+        """The mapping is only correct if the pipeline then keeps the values.
+
+        Asserted end to end because the failure mode is a field name that this
+        module renames and `normalise_fix` still does not recognise — which no test
+        of either function alone would catch.
+        """
+        fix = tracking.owntracks_to_fix(self.payload())
+        normalised = tracking.normalise_fix(
+            fix,
+            party_type="Employee",
+            party="HR-EMP-1",
+            branch="Dokki",
+            now_epoch=NOW + 5,
+        )
+
+        self.assertIsNotNone(normalised)
+        self.assertAlmostEqual(30.044420, normalised["lat"])
+        self.assertAlmostEqual(31.235712, normalised["lng"])
+        self.assertEqual(12.0, normalised["accuracy"])
+        self.assertEqual(187.0, normalised["heading"])
+        self.assertAlmostEqual(10.0, normalised["speed"], places=6)
+        self.assertEqual(0, normalised["is_mocked"])
+        # The handset's second, not the server's.
+        self.assertEqual(int(NOW), int(normalised["epoch"]))
+
+
 class TestNormalisation(unittest.TestCase):
     def kwargs(self, **extra):
         base = {

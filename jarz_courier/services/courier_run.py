@@ -346,6 +346,37 @@ def close_open_runs(
     return results
 
 
+
+def last_ping_for(*, party_type: str, party: str) -> Optional[Any]:
+    """Newest ``last_ping_on`` across this courier's runs, or ``None``.
+
+    Used by the duty stale sweep, which has to answer "has this courier gone quiet"
+    without caring which run the silence started in — a courier can have an
+    Abandoned run and a newer Open one within the same duty.
+
+    Returns ``None`` rather than raising when the courier has no run at all, or has
+    runs that never received a ping. Both are real states — a duty that auto-opened
+    on a fix which then failed validation is one — and the caller falls back to the
+    duty's own ``start_time``.
+    """
+    if not party_type or not party:
+        return None
+    try:
+        rows = frappe.get_all(
+            DOCTYPE,
+            filters={"party_type": party_type, "party": party, "last_ping_on": ["is", "set"]},
+            fields=["last_ping_on"],
+            order_by="last_ping_on desc",
+            limit=1,
+        ) or []
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(), "jarz_courier: last ping lookup failed"
+        )
+        return None
+    return rows[0].get("last_ping_on") if rows else None
+
+
 def stale_open_runs(*, minutes: int, limit: int = QUERY_LIMITS.RUNS_PER_SWEEP) -> List[Dict[str, Any]]:
     """Open runs whose newest durable ping is older than *minutes*.
 

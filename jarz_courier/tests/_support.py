@@ -156,6 +156,19 @@ def _install_frappe() -> None:
     def time_diff_in_seconds(later: Any, earlier: Any) -> float:
         return (get_datetime(later) - get_datetime(earlier)).total_seconds()
 
+    def convert_utc_to_system_timezone(utc_timestamp):
+        """Identity, i.e. "the site runs in UTC".
+
+        The real helper reads the timezone out of System Settings, which this
+        harness has no database for. Identity keeps the assertion honest: a test
+        can verify that a fix's `ts` and `epoch` describe the SAME instant — which
+        is the invariant that matters and the one that broke — without hard-coding
+        a timezone that is a per-site setting.
+        """
+        if getattr(utc_timestamp, "tzinfo", None) is None:
+            return utc_timestamp
+        return utc_timestamp.replace(tzinfo=None)
+
     utils.flt = flt
     utils.cint = cint
     utils.now_datetime = lambda: datetime.now()
@@ -165,6 +178,7 @@ def _install_frappe() -> None:
     utils.getdate = getdate
     utils.add_to_date = add_to_date
     utils.time_diff_in_seconds = time_diff_in_seconds
+    utils.convert_utc_to_system_timezone = convert_utc_to_system_timezone
     sys.modules["frappe.utils"] = utils
     fake.utils = utils
 

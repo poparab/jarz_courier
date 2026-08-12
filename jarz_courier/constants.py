@@ -226,6 +226,11 @@ class QUERY_LIMITS:
     PINGS_PER_BATCH = 1000
     #: Rows a single scheduled detector pass will look at.
     RUNS_PER_SWEEP = 200
+    #: Open duties a single stale sweep will consider. One per courier on shift, so
+    #: this is bounded by headcount rather than by traffic — 200 is far above any
+    #: plausible fleet and exists only so a corrupted status column cannot turn the
+    #: sweep into a full-table scan.
+    STALE_DUTIES_PER_SWEEP = 200
     PROOFS_PER_CONSENSUS_PASS = 2000
     PUSH_TOKENS_PER_SEND = 200
 

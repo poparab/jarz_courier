@@ -21,7 +21,13 @@ import frappe
 from frappe import _
 from frappe.utils import flt, now_datetime
 
-from jarz_courier.constants import DEPOSIT_STATUS, DOCTYPES, DUTY_STATUS, INVOICE_STATE
+from jarz_courier.constants import (
+    DEPOSIT_STATUS,
+    DOCTYPES,
+    DUTY_STATUS,
+    INVOICE_STATE,
+    QUERY_LIMITS,
+)
 from jarz_courier.services import courier_run
 
 DOCTYPE = DOCTYPES.COURIER_DUTY
@@ -170,6 +176,78 @@ def end_duty(
         "summary": summarize_duty(doc),
         "runs": _close_runs(party_type, party),
     }
+
+
+
+def close_stale_duties(*, minutes: int) -> Dict[str, Any]:
+    """Close Open duties whose courier stopped reporting ``minutes`` ago.
+
+    Added because the OwnTracks ingest path auto-opens a duty (an iPhone courier has
+    no foreground service to bind a shift to). Auto-opening without auto-closing
+    means duties accumulate forever — which was already happening before this
+    existed: CDUTY-00002 on staging sat Open from 2026-08-08 19:20 with no positions
+    flowing, because nothing has ever closed a duty except a courier tapping End
+    Shift.
+
+    Deliberately mirrors ``anomaly.watch_stale_pings``'s two-stage escalation rather
+    than inventing a second silence threshold, and is called from that same sweep so
+    a courier who went quiet does not get one verdict from the run watchdog and a
+    different one from here.
+
+    Never sets ``closing_cash``. A cash figure nobody counted is worse than a blank
+    one: blank is visibly missing, whereas a fabricated 0.00 reconciles silently and
+    wrongly. The note says why the duty closed so a manager reading it later is not
+    left guessing whether the courier declared anything.
+    """
+    from frappe.utils import time_diff_in_seconds
+
+    summary = {"examined": 0, "closed": 0}
+    try:
+        open_duties = frappe.get_all(
+            DOCTYPE,
+            filters={"status": DUTY_STATUS.OPEN},
+            fields=["name", "party_type", "party", "branch", "start_time"],
+            limit=QUERY_LIMITS.STALE_DUTIES_PER_SWEEP,
+        ) or []
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier: stale duty lookup failed")
+        return summary
+
+    for duty in open_duties:
+        summary["examined"] += 1
+        try:
+            # Latest ping across this courier's runs, falling back to when the duty
+            # opened. A duty with no run at all — the courier never sent a single
+            # position — must still age out, or it stays Open forever.
+            marker = courier_run.last_ping_for(
+                party_type=duty.get("party_type"), party=duty.get("party")
+            ) or duty.get("start_time")
+            if not marker:
+                continue
+
+            silent_minutes = max(
+                0.0, float(time_diff_in_seconds(now_datetime(), marker)) / 60.0
+            )
+            if silent_minutes < minutes:
+                continue
+
+            end_duty(
+                party_type=duty.get("party_type"),
+                party=duty.get("party"),
+                duty=duty.get("name"),
+                notes=_(
+                    "Closed automatically: no position reported for {0} minutes. "
+                    "No closing cash was declared."
+                ).format(int(silent_minutes)),
+            )
+            summary["closed"] += 1
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"jarz_courier: stale duty close failed for {duty.get('name')}",
+            )
+
+    return summary
 
 
 def _close_runs(party_type: str, party: str) -> List[Dict[str, Any]]:
