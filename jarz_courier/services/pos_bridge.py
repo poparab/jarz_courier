@@ -346,6 +346,45 @@ def mark_invoice_failed(
     )
 
 
+def mark_invoice_leg_started(
+    invoice_id: str,
+    *,
+    request_id: str | None = None,
+) -> Dict[str, Any]:
+    """The courier set off toward this stop. Gates the customer's live map.
+
+    Not an outcome and not a state change, so it is deliberately absent from the
+    frozen §5 trio above — but it delegates the same way, for the same reason:
+    the exclusivity sweep that closes the courier's other open legs lives on the
+    jarz_pos side and must not be reimplemented here.
+    """
+    return _call(
+        "jarz_pos.services.courier_delivery",
+        "mark_invoice_leg_started",
+        invoice_id,
+        request_id=request_id,
+    )
+
+
+def mark_invoice_leg_ended(
+    invoice_id: str,
+    *,
+    request_id: str | None = None,
+) -> Dict[str, Any]:
+    """Close this stop's leg without an outcome — the courier skipped it.
+
+    Delivered and failed already close their own leg, so this is only for the
+    abandon case. A client that sends this instead of an outcome leaves the
+    order Out for Delivery.
+    """
+    return _call(
+        "jarz_pos.services.courier_delivery",
+        "mark_invoice_leg_ended",
+        invoice_id,
+        request_id=request_id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Money — the deposit hand-over
 # ---------------------------------------------------------------------------

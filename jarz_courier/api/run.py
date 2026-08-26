@@ -155,6 +155,55 @@ def mark_delivered(
 
 
 @frappe.whitelist(allow_guest=False)
+def start_leg(
+    invoice_id: str,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Courier is setting off to this customer. Opens their live map.
+
+    The single UI action DropPin's protocol requires, and the one that fixes the
+    same leak on our own tracking page: dispatch moves a whole trip Out for
+    Delivery at once, so without a per-order signal every customer in the slot
+    sees the courier's position at the same time.
+
+    Deliberately **not** guarded here against starting a second leg — jarz_pos
+    closes the courier's other open legs as part of the same call, because "one
+    open leg per courier" is an invariant of the data, not a rule of this
+    transport.
+    """
+    _ensure_run_permission()
+    try:
+        _assert_stop_access(invoice_id, action_label="starting the drive to this stop")
+        return pos_bridge.mark_invoice_leg_started(invoice_id, request_id=request_id)
+    except frappe.PermissionError:
+        raise
+    except Exception as exc:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier start_leg failed")
+        return {"success": False, "error": str(exc)}
+
+
+@frappe.whitelist(allow_guest=False)
+def end_leg(
+    invoice_id: str,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Courier is no longer driving to this stop. Closes the map, nothing else.
+
+    Only for a skipped stop. ``mark_delivered`` and ``mark_failed`` close the leg
+    themselves, so a client should never need to pair this with either.
+    """
+    _ensure_run_permission()
+    try:
+        _assert_stop_access(invoice_id, action_label="ending the drive to this stop")
+        return pos_bridge.mark_invoice_leg_ended(invoice_id, request_id=request_id)
+    except frappe.PermissionError:
+        raise
+    except Exception as exc:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier end_leg failed")
+        return {"success": False, "error": str(exc)}
+
+
+@frappe.whitelist(allow_guest=False)
 def mark_failed(
     invoice_id: str,
     failure_reason: str,

@@ -71,6 +71,8 @@ _OPTIONAL_FIELDS = (
     "custom_delivery_accuracy_m",
     "custom_delivery_attempt_no",
     "custom_delivery_failure_reason",
+    "custom_leg_started_at",
+    "custom_leg_ended_at",
     "custom_sub_territory",
     "custom_delivery_date",
     "custom_delivery_time_from",
@@ -244,6 +246,13 @@ def _stop_summary(row: Dict[str, Any], address_map: Dict[str, Dict[str, Any]]) -
         },
         "arrived_at": row.get("custom_arrived_at"),
         "delivered_at": row.get("custom_delivered_at"),
+        # The open leg is what the app needs to decide whether to offer "Start
+        # delivery" or "Stop sharing" on this stop. Sent as the two raw
+        # timestamps rather than a computed boolean so the client can show WHEN
+        # the drive began, and so the open/closed rule stays defined in exactly
+        # one place server-side.
+        "leg_started_at": row.get("custom_leg_started_at"),
+        "leg_ended_at": row.get("custom_leg_ended_at"),
         "attempt_no": int(row.get("custom_delivery_attempt_no") or 0),
         "failure_reason": row.get("custom_delivery_failure_reason") or "",
         "remarks": row.get("remarks") or "",
