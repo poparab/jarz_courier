@@ -22,6 +22,7 @@ import ast
 import json
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from jarz_courier.tests import _support
@@ -468,6 +469,15 @@ class TestGetMyTrackingStatus(ApiTestCase):
 
 
 class TestGetOwnTracksSetup(ApiTestCase):
+    #: Who the endpoint must mint for. Pinned by patching ``frappe.session`` rather
+    #: than read from whatever the environment supplies: off-container the stub's
+    #: session user is ``courier@example.com``, under ``bench run-tests`` it is
+    #: ``Administrator``, and a hard-coded address made these tests pass in one
+    #: environment and fail in the other. Deliberately neither of those two values,
+    #: so the assertions prove the endpoint reads ``frappe.session.user`` — the
+    #: security property they are named for — and not a fixture coincidence.
+    SESSION_USER = "iphone-courier@example.com"
+
     def setup_call(self, *, existing_key=None, existing_secret=None):
         written = {}
 
@@ -475,6 +485,8 @@ class TestGetOwnTracksSetup(ApiTestCase):
             written[(doctype, name, field)] = value
 
         with self.as_roles(COURIER_ROLES), patch.object(
+            api.frappe, "session", SimpleNamespace(user=self.SESSION_USER)
+        ), patch.object(
             api.frappe.db, "get_value", return_value=existing_key, create=True
         ), patch.object(api.frappe.db, "set_value", side_effect=_set_value, create=True), patch.object(
             api, "_read_api_secret", return_value=existing_secret
@@ -500,15 +512,18 @@ class TestGetOwnTracksSetup(ApiTestCase):
 
         self.assertEqual("KEYNEW", result["configuration"]["username"])
         self.assertEqual("SECRETNEW", result["configuration"]["password"])
-        self.assertEqual({("User", "courier@example.com", "api_key"): "KEYNEW"}, written)
-        write_secret.assert_called_once_with("courier@example.com", "SECRETNEW")
+        self.assertEqual({("User", self.SESSION_USER, "api_key"): "KEYNEW"}, written)
+        write_secret.assert_called_once_with(self.SESSION_USER, "SECRETNEW")
 
     def test_a_key_without_a_readable_secret_gets_a_new_secret_only(self) -> None:
         result, written, write_secret = self.setup_call(existing_key="K1", existing_secret=None)
 
         self.assertEqual("K1", result["configuration"]["username"])
-        self.assertNotIn(("User", "courier@example.com", "api_key"), written)
+        self.assertNotIn(("User", self.SESSION_USER, "api_key"), written)
         write_secret.assert_called_once()
+        # Only the secret half is minted here, so it takes the first token; what
+        # matters is that it is written against the session user.
+        self.assertEqual(self.SESSION_USER, write_secret.call_args.args[0])
 
     def test_the_inline_url_round_trips_to_the_configuration(self) -> None:
         import base64 as _b64

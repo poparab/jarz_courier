@@ -28,6 +28,8 @@ from jarz_courier.tests import _support
 
 _support.install_stubs()
 
+from frappe.utils import convert_utc_to_system_timezone  # noqa: E402
+
 from jarz_courier.constants import ANOMALY_TYPE, LOCAL_WS_EVENTS  # noqa: E402
 from jarz_courier.services import tracking  # noqa: E402
 
@@ -96,12 +98,17 @@ class TestOwnTracksMapping(unittest.TestCase):
         fix = tracking.owntracks_to_fix(self.payload(tst=int(NOW)))
 
         self.assertIn("ts", fix)
-        # The harness runs the site in UTC, so `ts` is `epoch` rendered.
+        # `ts` is `epoch` rendered in the SITE's timezone, which is Africa/Cairo on
+        # the real site and UTC only in the site-less harness. Deriving `expected`
+        # through the same conversion keeps the assertion about the invariant that
+        # broke — that `ts` follows the handset clock — instead of about which
+        # timezone happens to be configured. It is not circular: had `ts` come from
+        # the server clock, it would be an hour off NOW and this would still fail.
         import datetime as _dt
 
-        expected = _dt.datetime.fromtimestamp(NOW, tz=_dt.timezone.utc).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        expected = convert_utc_to_system_timezone(
+            _dt.datetime.fromtimestamp(NOW, tz=_dt.timezone.utc)
+        ).strftime("%Y-%m-%d %H:%M:%S")
         self.assertEqual(expected, fix["ts"])
 
     def test_a_missing_accuracy_is_absent_rather_than_zero(self):
