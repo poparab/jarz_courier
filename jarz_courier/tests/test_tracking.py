@@ -31,7 +31,13 @@ _support.install_stubs()
 from jarz_courier.constants import ANOMALY_TYPE, LOCAL_WS_EVENTS  # noqa: E402
 from jarz_courier.services import tracking  # noqa: E402
 
-NOW = 1786000000.0
+# Anchored to the real clock, not a literal. `ingest()` measures a fix against
+# time.time() and refuses anything older than MAX_PAST_AGE_SEC (7 days) or
+# further ahead than MAX_FUTURE_SKEW_SEC (24 h). A hard-coded epoch therefore
+# passes for a week after it is written and then every batch test fails at once,
+# with "rejected" counts that look like a regression in the parser. An hour ago
+# keeps every offset the tests use inside both windows, indefinitely.
+NOW = float(int(time.time())) - 3600.0
 
 
 
@@ -107,9 +113,9 @@ class TestOwnTracksMapping(unittest.TestCase):
         fix = tracking.owntracks_to_fix(self.payload(acc=None))
         self.assertNotIn("accuracy", fix)
 
-    def test_non_location_messages_are_refused_for_the_caller_to_200(self):
+    def test_non_position_messages_are_refused_for_the_caller_to_200(self):
         """OwnTracks retries a non-2xx forever, so these cannot be errors."""
-        for message_type in ("transition", "waypoint", "lwt", "beacon", "card", "cmd"):
+        for message_type in ("waypoint", "lwt", "beacon", "card", "cmd", "waypoints"):
             with self.subTest(message_type=message_type):
                 self.assertIsNone(
                     tracking.owntracks_to_fix(self.payload(_type=message_type))
@@ -119,6 +125,60 @@ class TestOwnTracksMapping(unittest.TestCase):
         for payload in ({}, {"_type": ""}, {"_type": None}, "not a dict", None):
             with self.subTest(payload=payload):
                 self.assertIsNone(tracking.owntracks_to_fix(payload))
+
+    def test_a_geofence_transition_is_a_position_too(self):
+        """It carries the fix it fired on — the one we most want, since the stops
+        are pushed to the device as geofences."""
+        fix = tracking.owntracks_to_fix(
+            {
+                "_type": "transition",
+                "event": "enter",
+                "desc": "16834",
+                "lat": 30.0444,
+                "lon": 31.2357,
+                "tst": int(NOW),
+                "acc": 15,
+                "t": "c",
+                "wtst": 1786000000,
+                "tid": "ab",
+            }
+        )
+
+        self.assertIsNotNone(fix)
+        self.assertAlmostEqual(30.0444, fix["lat"])
+        self.assertEqual(int(NOW), fix["epoch"])
+        self.assertEqual(15, fix["accuracy"])
+
+    def test_meta_extracts_what_steers_the_device_without_touching_the_fix(self):
+        payload = self.payload(m=2, t="t", tid="ab")
+
+        meta = tracking.owntracks_meta(payload)
+        fix = tracking.owntracks_to_fix(payload)
+
+        self.assertEqual("location", meta["type"])
+        self.assertEqual(2, meta["mode"])
+        self.assertEqual("t", meta["trigger"])
+        self.assertEqual("ab", meta["tid"])
+        # The cache payload shape is a cross-app contract; `m`/`t` must not leak.
+        self.assertNotIn("m", fix)
+        self.assertNotIn("t", fix)
+        self.assertNotIn("mode", fix)
+
+    def test_meta_on_a_transition_carries_the_event(self):
+        meta = tracking.owntracks_meta(
+            {"_type": "transition", "event": "Enter", "desc": "16834", "tid": "ab"}
+        )
+        self.assertEqual("transition", meta["type"])
+        self.assertEqual("enter", meta["event"])
+        self.assertEqual("16834", meta["desc"])
+        self.assertIsNone(meta["mode"])
+
+    def test_meta_never_raises_on_junk(self):
+        for junk in (None, "x", 3, [], {}):
+            with self.subTest(junk=junk):
+                meta = tracking.owntracks_meta(junk)
+                self.assertEqual("", meta["type"])
+                self.assertIsNone(meta["mode"])
 
     def test_the_type_check_is_case_insensitive(self):
         self.assertIsNotNone(tracking.owntracks_to_fix(self.payload(_type="Location")))

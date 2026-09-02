@@ -24,7 +24,9 @@ decisions; it does not make them.
 
 from __future__ import annotations
 
+import base64
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 import frappe
@@ -36,7 +38,15 @@ except Exception:  # pragma: no cover
     _frappe_rate_limit = None  # type: ignore[assignment]
 
 from jarz_courier.constants import QUERY_LIMITS, ROLES
-from jarz_courier.services import courier_onboarding, duty_session, location_cache, pos_bridge, tracking
+from jarz_courier.services import (
+    courier_onboarding,
+    duty_session,
+    location_cache,
+    owntracks_steering,
+    pos_bridge,
+    run_sheet,
+    tracking,
+)
 
 
 def _ensure_tracking_permission() -> None:
@@ -161,8 +171,8 @@ def _owntracks_rate_limited(fn):
 
 @frappe.whitelist(allow_guest=False)
 @_owntracks_rate_limited
-def ingest_owntracks(**kwargs: Any) -> Dict[str, Any]:
-    """Accept a position from the OwnTracks iOS app.
+def ingest_owntracks(**kwargs: Any) -> Any:
+    """Accept a message from the OwnTracks iOS app and answer with commands.
 
     Exists because Safari cannot track in the background at all, so a courier on an
     iPhone runs the courier **web** app for the work and OwnTracks for the location.
@@ -184,6 +194,13 @@ def ingest_owntracks(**kwargs: Any) -> Dict[str, Any]:
     findings; no ``Courier Run`` means nothing for the stale-run watchdog to watch
     and no polyline at close. ``ingest`` is what produces all of it.
 
+    **The response body is a bare JSON array, not the Frappe envelope.** OwnTracks
+    executes commands it finds there — ``setConfiguration``, ``setWaypoints``,
+    ``reportLocation`` — and ignores anything that is not an array. That is the
+    only lever we hold over a device we do not build software for, so
+    ``services.owntracks_steering`` decides what goes in it and this function
+    returns a raw ``werkzeug`` Response to bypass the envelope.
+
     Reads ``frappe.form_dict`` rather than declaring the fields as parameters.
     OwnTracks POSTs a bare JSON object, which Frappe loads into ``form_dict``
     wholesale, and its ``_type`` discriminator is a leading-underscore name that
@@ -194,49 +211,280 @@ def ingest_owntracks(**kwargs: Any) -> Dict[str, Any]:
     transition would turn one unsupported message into a permanent hot loop.
     """
     _ensure_tracking_permission()
-    try:
-        payload = dict(frappe.form_dict or {})
-        fix = tracking.owntracks_to_fix(payload)
-        if fix is None:
-            # Not a location report — a transition, waypoint or last-will message.
-            return {
-                "success": True,
-                "accepted": 0,
-                "ignored": str(payload.get("_type") or "unknown"),
-            }
+    result = _ingest_owntracks(dict(frappe.form_dict or {}))
+    return _owntracks_response(result)
 
+
+def _ingest_owntracks(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """The testable half: ingest the message, then plan the reply commands."""
+    meta = tracking.owntracks_meta(payload)
+    fix = tracking.owntracks_to_fix(payload)
+    result: Dict[str, Any] = {"success": True, "accepted": 0, "commands": []}
+    if fix is None:
+        result["ignored"] = meta.get("type") or "unknown"
+
+    try:
         identity = courier_onboarding.ensure_courier_setup(
             action_label="location tracking"
         )
+        branch, party, party_type = identity["branch"], identity["party"], identity["party_type"]
 
-        # Auto-open the duty. An iPhone courier has no foreground service to bind a
-        # shift to, and OwnTracks knows nothing about duties, so requiring a manual
-        # Start Shift would mean the common failure is "he forgot, and was invisible
-        # all day with nothing to tell him". start_duty already returns the open duty
-        # when there is one, so this is idempotent; the get_open_duty check just
-        # avoids the insert path's extra work on every ping.
-        open_duty = duty_session.get_open_duty(identity["party_type"], identity["party"])
-        if not open_duty:
-            opened = duty_session.start_duty(
-                party_type=identity["party_type"],
-                party=identity["party"],
-                branch=identity["branch"],
-            ) or {}
-            open_duty = opened.get("duty") or {}
+        if fix is not None:
+            # Auto-open the duty. An iPhone courier has no foreground service to bind
+            # a shift to, and OwnTracks knows nothing about duties, so requiring a
+            # manual Start Shift would mean the common failure is "he forgot, and was
+            # invisible all day with nothing to tell him". start_duty already returns
+            # the open duty when there is one, so this is idempotent; the
+            # get_open_duty check just avoids the insert path's work on every ping.
+            open_duty = duty_session.get_open_duty(party_type, party)
+            if not open_duty:
+                opened = duty_session.start_duty(
+                    party_type=party_type, party=party, branch=branch
+                ) or {}
+                open_duty = opened.get("duty") or {}
 
-        result = tracking.ingest(
-            party_type=identity["party_type"],
-            party=identity["party"],
-            branch=identity["branch"],
-            pings=[fix],
-            duty=(open_duty or {}).get("name"),
-        )
-        return {"success": True, **result}
+            ingested = tracking.ingest(
+                party_type=party_type,
+                party=party,
+                branch=branch,
+                pings=[fix],
+                duty=(open_duty or {}).get("name"),
+            )
+            result.update(ingested)
+
+        result["commands"] = _steer_device(identity, meta, carries_position=fix is not None)
+        return result
     except frappe.PermissionError:
         raise
     except Exception as exc:
         frappe.log_error(frappe.get_traceback(), "jarz_courier ingest_owntracks failed")
+        return {"success": False, "error": str(exc), "commands": []}
+
+
+def _steer_device(
+    identity: Dict[str, Any], meta: Dict[str, Any], *, carries_position: bool
+) -> List[Dict[str, Any]]:
+    """Commands for the response body. Never raises — steering is best-effort and a
+    failure here must not cost the position that was just stored."""
+    branch, party = identity["branch"], identity["party"]
+    try:
+        if meta.get("mode") is not None:
+            location_cache.write_owntracks_mode(branch, party, meta["mode"])
+
+        steer_window = location_cache.should_steer(branch, party)
+        # The run sheet is consulted inside the window, or for a message with no
+        # position (the nudge case). On the 30 s stream it would otherwise be a
+        # query per ping for a decision that changes a few times a day.
+        stops = _open_stops(identity) if (steer_window or not carries_position) else []
+        waypoints = owntracks_steering.build_waypoints(stops) if steer_window else []
+        device_mode = meta.get("mode")
+        if device_mode is None:
+            device_mode = location_cache.read_owntracks_mode(branch, party)
+
+        plan = owntracks_steering.plan_commands(
+            message_type=meta.get("type") or "",
+            trigger=meta.get("trigger") or "",
+            device_mode=device_mode,
+            has_open_stops=bool(stops),
+            steer_window=steer_window,
+            waypoints=waypoints,
+            pushed_fingerprint=(
+                location_cache.read_waypoints_fingerprint(branch, party) if steer_window else None
+            ),
+        )
+        if plan.get("fingerprint"):
+            location_cache.remember_waypoints_fingerprint(branch, party, plan["fingerprint"])
+        return list(plan.get("commands") or [])
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier owntracks steering failed")
+        return []
+
+
+def _open_stops(identity: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The courier's current run, or ``[]`` — a failed lookup must not block ingest."""
+    try:
+        branches = list(identity.get("pos_profiles") or []) or [identity.get("branch")]
+        run = run_sheet.get_run(
+            party_type=identity["party_type"], party=identity["party"], branches=branches
+        )
+        return list((run or {}).get("stops") or [])
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier owntracks run lookup failed")
+        return []
+
+
+def _owntracks_response(result: Dict[str, Any]) -> Any:
+    """A bare JSON array for OwnTracks.
+
+    ``frappe.handler.handle`` passes a ``werkzeug`` Response straight through, which
+    skips the ``{"message": ...}`` envelope — necessary, because OwnTracks only acts
+    on a top-level array. The request lifecycle still commits (``frappe/app.py``
+    commits every POST regardless of what the handler returned), so nothing written
+    during ingest is lost by returning early.
+
+    Falls back to the plain list when ``werkzeug`` is unavailable, which is only the
+    unit-test harness; a real Frappe process always has it.
+    """
+    commands = list(result.get("commands") or [])
+    try:
+        from werkzeug.wrappers import Response
+    except ImportError:  # pragma: no cover - harness only
+        return commands
+    return Response(json.dumps(commands), status=200, mimetype="application/json")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# iPhone setup — self-service
+# ─────────────────────────────────────────────────────────────────────────────
+
+OWNTRACKS_APP_STORE_URL = "https://apps.apple.com/app/owntracks/id692424691"
+
+
+@frappe.whitelist(allow_guest=False)
+def get_owntracks_setup() -> Dict[str, Any]:
+    """Everything a courier needs to point OwnTracks at us, for their own account.
+
+    Returns the ``_type: configuration`` document and an ``owntracks:///config``
+    URL carrying it base64-encoded. Opened on the iPhone, that URL imports the
+    whole setup in one tap — endpoint, credentials, Move mode, and the remote-
+    command switches the server relies on. Hand configuration is the failure mode
+    this exists to remove: a device that misses ``cmd`` or ``remoteConfiguration``
+    silently ignores every command we send, and nothing on our side can tell.
+
+    **Mints an API key pair for the calling user if they have none.** Frappe's own
+    ``generate_keys`` is System-Manager-only, which would make every iPhone courier
+    a ticket for a manager. A courier issuing a credential for *their own* account
+    is the same trust boundary as knowing their own password — the secret grants
+    exactly what the password does — so it is scoped hard to ``frappe.session.user``
+    and to the courier roles. An existing pair is reused so re-opening the page
+    never invalidates a working device.
+
+    Writes with ``db.set_value`` and ``set_encrypted_password`` rather than saving
+    the User document: on v16 a Role Profile strips every role not in it on
+    ``save()``, and that would delete the ``Jarz Courier`` role on the very account
+    being set up.
+    """
+    _ensure_tracking_permission()
+    try:
+        identity = courier_onboarding.ensure_courier_setup(
+            action_label="setting up iPhone tracking"
+        )
+        user = frappe.session.user
+        api_key, api_secret = _ensure_api_credentials(user)
+        configuration = owntracks_steering.device_configuration(
+            ingest_url=_ingest_url(),
+            api_key=api_key,
+            api_secret=api_secret,
+            party=identity["party"],
+            display_name=str(identity.get("display_name") or ""),
+        )
+        encoded = base64.b64encode(
+            json.dumps(configuration, separators=(",", ":")).encode("utf-8")
+        ).decode("ascii")
+        return {
+            "success": True,
+            "configuration": configuration,
+            "inline_url": f"owntracks:///config?inline={encoded}",
+            "app_store_url": OWNTRACKS_APP_STORE_URL,
+            "ingest_url": configuration["url"],
+            "tracker_id": configuration["tid"],
+        }
+    except frappe.PermissionError:
+        raise
+    except Exception as exc:
+        # Nothing above puts the secret in a message, so the traceback is safe to log.
+        frappe.log_error(frappe.get_traceback(), "jarz_courier get_owntracks_setup failed")
         return {"success": False, "error": str(exc)}
+
+
+@frappe.whitelist(allow_guest=False)
+def get_my_tracking_status() -> Dict[str, Any]:
+    """What the server last heard from this courier's tracker, for the setup screen.
+
+    The courier cannot see OwnTracks working — it has no UI of ours — so the only
+    proof the setup took is the server saying "I heard from you N seconds ago, in
+    Move mode". Without this, "is it working?" is a phone call to a manager who
+    then opens the fleet map.
+    """
+    _ensure_tracking_permission()
+    try:
+        identity = courier_onboarding.ensure_courier_setup(action_label="checking tracking")
+        branch, party, party_type = identity["branch"], identity["party"], identity["party_type"]
+
+        position = location_cache.read_position(branch, party) or {}
+        epoch = position.get("epoch")
+        age: Optional[float] = None
+        if epoch is not None:
+            try:
+                age = max(0.0, time.time() - float(epoch))
+            except (TypeError, ValueError):
+                age = None
+
+        stops = _open_stops(identity)
+        return {
+            "success": True,
+            "last_position_age_sec": age,
+            "last_position_ts": position.get("ts"),
+            "device_mode": location_cache.read_owntracks_mode(branch, party),
+            "desired_mode": owntracks_steering.desired_mode(has_open_stops=bool(stops)),
+            "open_stops": len(stops),
+            "pinned_stops": len(owntracks_steering.build_waypoints(stops)),
+            "duty_open": bool(duty_session.get_open_duty(party_type, party)),
+            "ingest_url": _ingest_url(),
+        }
+    except frappe.PermissionError:
+        raise
+    except Exception as exc:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier get_my_tracking_status failed")
+        return {"success": False, "error": str(exc)}
+
+
+def _ingest_url() -> str:
+    from frappe.utils import get_url
+
+    return get_url("/api/method/jarz_courier.api.tracking.ingest_owntracks")
+
+
+def _ensure_api_credentials(user: str) -> tuple:
+    """``(api_key, api_secret)`` for *user*, minting a pair only when none works.
+
+    Reuse first: regenerating on every visit would invalidate the pair already on
+    the courier's phone each time they open the setup screen to check it.
+    """
+    api_key = frappe.db.get_value("User", user, "api_key")
+    api_secret = _read_api_secret(user) if api_key else None
+    if api_key and api_secret:
+        return str(api_key), str(api_secret)
+
+    if not api_key:
+        # Only ever written when absent. The key is the public half and may be
+        # referenced elsewhere (Desk shows it); rewriting one that exists gains
+        # nothing and changes something a manager may have copied down.
+        api_key = _new_token()
+        frappe.db.set_value("User", user, "api_key", api_key, update_modified=False)
+
+    api_secret = _new_token()
+    _write_api_secret(user, api_secret)
+    return str(api_key), api_secret
+
+
+def _read_api_secret(user: str) -> Optional[str]:
+    from frappe.utils.password import get_decrypted_password
+
+    try:
+        return get_decrypted_password("User", user, "api_secret", raise_exception=False)
+    except Exception:
+        return None
+
+
+def _write_api_secret(user: str, secret: str) -> None:
+    from frappe.utils.password import set_encrypted_password
+
+    set_encrypted_password("User", user, secret, "api_secret")
+
+
+def _new_token() -> str:
+    return frappe.generate_hash(length=15)
 
 
 @frappe.whitelist(allow_guest=False)

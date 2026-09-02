@@ -76,6 +76,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import frappe
 
+from jarz_courier.constants import OWNTRACKS
+
 #: 15 minutes. Long enough that a courier in a lift is still "on the map", short
 #: enough that a finished shift stops appearing as live.
 LOCATION_TTL_SEC = 15 * 60
@@ -132,6 +134,20 @@ def publish_throttle_key(branch: str, party: str) -> str:
 
 def db_touch_key(branch: str, party: str) -> str:
     return f"courier:dbtouch:{branch}:{party}"
+
+
+def owntracks_mode_key(branch: str, party: str) -> str:
+    """Last monitoring mode the courier's OwnTracks app reported (``m`` field)."""
+    return f"courier:otmode:{branch}:{party}"
+
+
+def owntracks_waypoints_key(branch: str, party: str) -> str:
+    """Fingerprint of the stop geofences last pushed to the device."""
+    return f"courier:otwp:{branch}:{party}"
+
+
+def owntracks_steer_key(branch: str, party: str) -> str:
+    return f"courier:otsteer:{branch}:{party}"
 
 
 def run_snapshot_key(branch: str, party: str) -> str:
@@ -462,6 +478,74 @@ def _claim(key: str, ttl_sec: int) -> bool:
         return bool(won)
     except Exception:
         return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OwnTracks steering state (iPhone couriers)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def write_owntracks_mode(branch: str, party: str, mode: Any) -> None:
+    """Remember the ``m`` (monitoring mode) the device last reported. Never raises."""
+    if not (branch and party) or mode is None:
+        return
+    try:
+        _cache().set_value(
+            owntracks_mode_key(branch, party),
+            str(int(mode)),
+            expires_in_sec=OWNTRACKS.MODE_TTL_SEC,
+        )
+    except Exception:
+        _logger().warning(f"jarz_courier: owntracks mode write failed for {branch}/{party}")
+
+
+def read_owntracks_mode(branch: str, party: str) -> Optional[int]:
+    if not (branch and party):
+        return None
+    try:
+        raw = _cache().get_value(owntracks_mode_key(branch, party), expires=True)
+    except Exception:
+        return None
+    if raw in (None, ""):
+        return None
+    try:
+        return int(raw.decode() if isinstance(raw, bytes) else raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def read_waypoints_fingerprint(branch: str, party: str) -> Optional[str]:
+    if not (branch and party):
+        return None
+    try:
+        raw = _cache().get_value(owntracks_waypoints_key(branch, party), expires=True)
+    except Exception:
+        return None
+    if raw in (None, ""):
+        return None
+    return raw.decode() if isinstance(raw, bytes) else str(raw)
+
+
+def remember_waypoints_fingerprint(branch: str, party: str, fingerprint: str) -> None:
+    """Never raises. A failed write only means the set is pushed again next window."""
+    if not (branch and party):
+        return
+    try:
+        _cache().set_value(
+            owntracks_waypoints_key(branch, party),
+            str(fingerprint),
+            expires_in_sec=OWNTRACKS.WAYPOINTS_TTL_SEC,
+        )
+    except Exception:
+        _logger().warning(f"jarz_courier: waypoint fingerprint write failed for {branch}/{party}")
+
+
+def should_steer(branch: str, party: str) -> bool:
+    """True at most once per :data:`OWNTRACKS.STEER_THROTTLE_SEC` per courier.
+
+    Fails **open** like the other throttles: a Redis blip should cost one extra
+    run-sheet query, not a courier stuck in the wrong mode until Redis returns.
+    """
+    return _claim(owntracks_steer_key(branch, party), OWNTRACKS.STEER_THROTTLE_SEC)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

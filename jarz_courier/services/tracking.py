@@ -172,10 +172,20 @@ def _resolve_timestamp(raw: Dict[str, Any], reference_epoch: float):
 # OwnTracks (external iOS tracker)
 # ─────────────────────────────────────────────────────────────────────────────
 
-#: The only OwnTracks message type that carries a position. The app also emits
-#: ``transition``, ``waypoint``, ``lwt``, ``beacon``, ``card`` and ``cmd`` on the
-#: same endpoint, so the type has to be checked rather than assumed.
+#: OwnTracks message types that carry a usable position. ``location`` is the
+#: periodic report; ``transition`` is a geofence enter/leave and carries the fix it
+#: fired on — which is exactly the position we most want, since we push the day's
+#: stops to the device as geofences. The app also emits ``waypoint``, ``lwt``,
+#: ``beacon``, ``card`` and ``cmd`` on the same endpoint, so the type has to be
+#: checked rather than assumed.
 OWNTRACKS_LOCATION_TYPE = "location"
+OWNTRACKS_TRANSITION_TYPE = "transition"
+OWNTRACKS_POSITION_TYPES = frozenset({OWNTRACKS_LOCATION_TYPE, OWNTRACKS_TRANSITION_TYPE})
+
+#: ``t`` (trigger) value on a location report the device sent because *we* asked
+#: for it with a ``reportLocation`` command. Never answer one of these with another
+#: request, or the two sides ping-pong forever.
+OWNTRACKS_TRIGGER_REQUESTED = "r"
 
 #: OwnTracks reports ``vel`` in km/h. Every ``speed`` in this pipeline is metres
 #: per second and is never converted downstream — ``geo_track`` computes its
@@ -206,7 +216,7 @@ def owntracks_to_fix(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     if not isinstance(payload, dict):
         return None
-    if str(payload.get("_type") or "").strip().lower() != OWNTRACKS_LOCATION_TYPE:
+    if str(payload.get("_type") or "").strip().lower() not in OWNTRACKS_POSITION_TYPES:
         return None
 
     fix: Dict[str, Any] = {
@@ -242,6 +252,34 @@ def owntracks_to_fix(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         fix["speed"] = velocity_kmh * KMH_TO_MS
 
     return fix
+
+
+def owntracks_meta(payload: Any) -> Dict[str, Any]:
+    """The parts of an OwnTracks message that are *about* the device, not a fix.
+
+    Kept separate from :func:`owntracks_to_fix` because the fix shape is a frozen
+    cross-app contract (``courier:loc:*`` is read by jarz_pos) and these fields
+    must not leak into it. They drive server-side steering instead:
+
+    * ``mode`` — the ``m`` field, the monitoring mode the device is in
+      (``1`` significant, ``2`` move; iOS only). Lets the server push a mode
+      change only when the device is actually in the wrong one.
+    * ``trigger`` — the ``t`` field. ``r`` means "you asked for this"; the server
+      must not answer it with another request.
+    * ``event`` / ``desc`` — for a ``transition``, whether the device entered or
+      left a pushed geofence and which one.
+    """
+    if not isinstance(payload, dict):
+        return {"type": "", "mode": None, "trigger": "", "event": "", "desc": "", "tid": ""}
+    mode = _as_float(payload.get("m"))
+    return {
+        "type": str(payload.get("_type") or "").strip().lower(),
+        "mode": int(mode) if mode is not None else None,
+        "trigger": str(payload.get("t") or "").strip(),
+        "event": str(payload.get("event") or "").strip().lower(),
+        "desc": str(payload.get("desc") or "").strip(),
+        "tid": str(payload.get("tid") or "").strip(),
+    }
 
 
 def _epoch_to_site_datetime_string(epoch: float) -> Optional[str]:

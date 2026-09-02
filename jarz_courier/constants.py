@@ -235,6 +235,55 @@ class QUERY_LIMITS:
     PUSH_TOKENS_PER_SEND = 200
 
 
+class OWNTRACKS:
+    """Knobs for the iPhone tracker (OwnTracks), steered from the server.
+
+    Safari cannot track in the background, so an iPhone courier's positions come
+    from the OwnTracks app posting to ``api/tracking.ingest_owntracks``. OwnTracks
+    accepts commands in the HTTP *response* — ``setConfiguration``, ``setWaypoints``,
+    ``reportLocation`` — which is the only lever we have over a device we do not
+    build software for. Every value here is a trade between coverage and the
+    courier's battery, and is only ever applied while they are carrying orders.
+    """
+
+    #: OwnTracks ``monitoring`` values. Move is a timer/displacement stream; Significant
+    #: is Apple's "moved ~500 m or ~5 min" service; Quiet reports nothing.
+    MODE_QUIET = -1
+    MODE_MANUAL = 0
+    MODE_SIGNIFICANT = 1
+    MODE_MOVE = 2
+
+    #: Move-mode cadence while the courier has stops out. 30 s / 25 m is dense
+    #: enough to draw a street-level trail and coarse enough to survive a shift.
+    MOVE_INTERVAL_SEC = 30
+    MOVE_DISPLACEMENT_M = 25
+
+    #: A fix worse than this is a cell-tower guess, and the anomaly detectors would
+    #: read it as a 300 m jump. Suppressed on the device rather than server-side so
+    #: it never costs the battery of an upload.
+    IGNORE_INACCURATE_M = 200
+    IGNORE_STALE_DAYS = 1
+
+    #: Geofence radius pushed for each stop. Wide enough for consumer GPS at a door
+    #: in a dense street, narrow enough that "entered" means "arrived", not "drove
+    #: past the block".
+    WAYPOINT_RADIUS_M = 100
+
+    #: How often the server re-evaluates mode/waypoints for one courier. Every ping
+    #: would mean a run-sheet query per 30 s per courier for a decision that changes
+    #: a few times a day.
+    STEER_THROTTLE_SEC = 300
+    #: How long a remembered waypoint fingerprint lives. After this the set is pushed
+    #: again even if unchanged — a device that lost them (reinstall, cleared) gets
+    #: them back without anyone noticing it needed to.
+    WAYPOINTS_TTL_SEC = 6 * 60 * 60
+    #: How long a remembered device mode lives.
+    MODE_TTL_SEC = 60 * 60
+
+    #: Tracker id length OwnTracks displays on its map (exactly two characters).
+    TID_LENGTH = 2
+
+
 __all__ = [
     "ANOMALY_STATUS",
     "ANOMALY_TYPE",
@@ -247,6 +296,7 @@ __all__ = [
     "GEO_SOURCE_CUSTOMER_PIN",
     "INVOICE_STATE",
     "LOCAL_WS_EVENTS",
+    "OWNTRACKS",
     "PROOF_TYPES",
     "PUSH_TYPE",
     "QUERY_LIMITS",

@@ -164,6 +164,9 @@ jobs:
             # closed one. Without this module in the array the closer is untested
             # and the array is where "untested" becomes invisible.
             test_stale_duty
+            # The commands we put in OwnTracks' HTTP response — the only lever we
+            # hold over an iPhone tracker we do not build.
+            test_owntracks_steering
             test_courier_run
             # test_anomaly reads the Courier Anomaly DocType JSON and asserts it
             # declares no monetary field. That is the machine-checkable form of B9's

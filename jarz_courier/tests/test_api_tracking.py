@@ -52,6 +52,23 @@ class ApiTestCase(unittest.TestCase):
         # MagicMock is never None, so the non-location guard would look like it
         # passed while actually never firing.
         self.tracking.owntracks_to_fix.side_effect = real_tracking.owntracks_to_fix
+        self.tracking.owntracks_meta.side_effect = real_tracking.owntracks_meta
+
+        # Steering is exercised in its own class; here it must be inert, or every
+        # ingest test would also need a run sheet and a Redis.
+        for name, value in (
+            ("should_steer", False),
+            ("read_owntracks_mode", None),
+            ("read_waypoints_fingerprint", None),
+            ("write_owntracks_mode", None),
+            ("remember_waypoints_fingerprint", None),
+        ):
+            patcher = patch.object(api.location_cache, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(api.run_sheet, "get_run", return_value={"stops": []})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         patches = [
             patch.object(api, "tracking", self.tracking),
@@ -203,8 +220,26 @@ class TestIngestOwnTracks(ApiTestCase):
     }
 
     def post(self, body, roles=COURIER_ROLES):
-        with self.as_roles(roles), patch.object(api.frappe, "form_dict", dict(body), create=True):
-            return api.ingest_owntracks()
+        """Drive the testable half directly; the whitelisted wrapper only adds the
+        permission gate and the raw-array response, covered below."""
+        with self.as_roles(roles):
+            if roles is NO_ROLES:
+                with patch.object(api.frappe, "form_dict", dict(body), create=True):
+                    return api.ingest_owntracks()
+            return api._ingest_owntracks(dict(body))
+
+    def test_the_wire_response_is_a_bare_array_not_the_envelope(self) -> None:
+        """OwnTracks acts only on a top-level JSON array. Under the test harness
+        werkzeug is absent, so the wrapper returns the list itself; on a real
+        server it is the body of a werkzeug Response. Either way: no envelope."""
+        with self.as_roles(COURIER_ROLES), patch.object(
+            api.frappe, "form_dict", dict(self.LOCATION), create=True
+        ):
+            wire = api.ingest_owntracks()
+
+        body = wire if isinstance(wire, list) else json.loads(wire.get_data(as_text=True))
+        self.assertIsInstance(body, list)
+        self.assertNotIn("success", str(body))
 
     def test_a_location_report_is_ingested(self) -> None:
         result = self.post(self.LOCATION)
@@ -235,14 +270,48 @@ class TestIngestOwnTracks(ApiTestCase):
         with self.assertRaises(api.frappe.PermissionError):
             self.post(self.LOCATION, roles=NO_ROLES)
 
-    def test_a_non_location_message_is_a_success_with_nothing_stored(self) -> None:
-        """A 4xx here would make OwnTracks retry a region transition forever."""
-        result = self.post({"_type": "transition", "event": "enter"})
+    def test_a_non_position_message_is_a_success_with_nothing_stored(self) -> None:
+        """A 4xx here would make OwnTracks retry a last-will message forever."""
+        result = self.post({"_type": "lwt", "tid": "ab"})
 
         self.assertTrue(result["success"])
         self.assertEqual(0, result["accepted"])
-        self.assertEqual("transition", result["ignored"])
+        self.assertEqual("lwt", result["ignored"])
         self.tracking.ingest.assert_not_called()
+
+    def test_a_geofence_transition_is_ingested_as_a_position(self) -> None:
+        """It carries the fix it fired on — the stop geofences we push exist to
+        produce exactly this message at the door."""
+        result = self.post(
+            {
+                "_type": "transition",
+                "event": "enter",
+                "desc": "16834",
+                "lat": 30.0444,
+                "lon": 31.2357,
+                "tst": 1786000000,
+                "acc": 15,
+                "t": "c",
+                "tid": "ab",
+            }
+        )
+
+        self.assertTrue(result["success"])
+        self.tracking.ingest.assert_called_once()
+        self.assertNotIn("ignored", result)
+
+    def test_every_reply_carries_a_commands_list(self) -> None:
+        for body in (self.LOCATION, {"_type": "lwt"}, {"hello": "world"}):
+            with self.subTest(body=body):
+                self.assertIsInstance(self.post(body)["commands"], list)
+
+    def test_a_steering_failure_does_not_cost_the_position(self) -> None:
+        with patch.object(api.location_cache, "should_steer", side_effect=RuntimeError("redis")):
+            result = self.post(self.LOCATION)
+
+        self.assertTrue(result["success"])
+        self.tracking.ingest.assert_called_once()
+        self.assertEqual([], result["commands"])
 
     def test_a_junk_body_does_not_raise(self) -> None:
         result = self.post({"hello": "world"})
@@ -291,6 +360,178 @@ class TestIngestOwnTracks(ApiTestCase):
         ):
             with self.assertRaises(api.frappe.PermissionError):
                 self.post(self.LOCATION)
+
+
+class TestOwnTracksSteeringWiring(ApiTestCase):
+    """The endpoint feeds the pure planner the right inputs and persists its verdict."""
+
+    STOPS = [
+        {"invoice": "INV-1", "display_id": "16834", "address": {"latitude": 30.0444, "longitude": 31.2357}},
+        {"invoice": "INV-2", "display_id": "16835", "address": {}},
+    ]
+
+    def post(self, body):
+        with self.as_roles(COURIER_ROLES):
+            return api._ingest_owntracks(dict(body))
+
+    def location(self, **extra):
+        base = {"_type": "location", "lat": 30.0, "lon": 31.0, "tst": 1786000000, "tid": "ab"}
+        base.update(extra)
+        return base
+
+    def actions(self, result):
+        return [c["action"] for c in result["commands"]]
+
+    def test_outside_the_window_nothing_is_queried_or_sent(self) -> None:
+        with patch.object(api.run_sheet, "get_run") as get_run:
+            result = self.post(self.location(m=1))
+
+        get_run.assert_not_called()
+        self.assertEqual([], self.actions(result))
+
+    def test_inside_the_window_the_run_sheet_decides_the_mode(self) -> None:
+        with patch.object(api.location_cache, "should_steer", return_value=True), patch.object(
+            api.run_sheet, "get_run", return_value={"stops": self.STOPS}
+        ):
+            result = self.post(self.location(m=1))  # device in Significant, orders out
+
+        cfg = next(c for c in result["commands"] if c["action"] == "setConfiguration")
+        self.assertEqual(2, cfg["configuration"]["monitoring"])
+
+    def test_the_run_sheet_is_scoped_to_the_courier_and_their_profiles(self) -> None:
+        with patch.object(api.location_cache, "should_steer", return_value=True), patch.object(
+            api.run_sheet, "get_run", return_value={"stops": []}
+        ) as get_run:
+            self.post(self.location(m=2))
+
+        kwargs = get_run.call_args.kwargs
+        self.assertEqual("HR-EMP-00042", kwargs["party"])
+        self.assertEqual(["Dokki"], kwargs["branches"])
+
+    def test_only_pinned_stops_become_waypoints_and_the_set_is_remembered(self) -> None:
+        with patch.object(api.location_cache, "should_steer", return_value=True), patch.object(
+            api.run_sheet, "get_run", return_value={"stops": self.STOPS}
+        ), patch.object(api.location_cache, "remember_waypoints_fingerprint") as remember:
+            result = self.post(self.location(m=2))
+
+        wp = next(c for c in result["commands"] if c["action"] == "setWaypoints")
+        self.assertEqual(["16834"], [w["desc"] for w in wp["waypoints"]["waypoints"]])
+        remember.assert_called_once()
+        self.assertEqual("Dokki", remember.call_args.args[0])
+
+    def test_the_device_mode_is_remembered_from_the_payload(self) -> None:
+        with patch.object(api.location_cache, "write_owntracks_mode") as write:
+            self.post(self.location(m=2))
+
+        write.assert_called_once_with("Dokki", "HR-EMP-00042", 2)
+
+    def test_a_positionless_message_with_orders_out_is_nudged(self) -> None:
+        with patch.object(api.run_sheet, "get_run", return_value={"stops": self.STOPS}):
+            result = self.post({"_type": "lwt", "tid": "ab"})
+
+        self.assertEqual(["reportLocation"], self.actions(result))
+
+
+class TestGetMyTrackingStatus(ApiTestCase):
+    def test_it_reports_what_the_server_last_heard(self) -> None:
+        import time as _time
+
+        with self.as_roles(COURIER_ROLES), patch.object(
+            api.location_cache,
+            "read_position",
+            return_value={"epoch": _time.time() - 90, "ts": "2026-08-12 10:00:00"},
+        ), patch.object(api.location_cache, "read_owntracks_mode", return_value=2), patch.object(
+            api, "_ingest_url", return_value="https://x/api/method/ingest"
+        ):
+            status = api.get_my_tracking_status()
+
+        self.assertTrue(status["success"])
+        self.assertAlmostEqual(90, status["last_position_age_sec"], delta=5)
+        self.assertEqual(2, status["device_mode"])
+        self.assertEqual(1, status["desired_mode"])  # no stops in the default run sheet
+        self.assertTrue(status["duty_open"])
+        self.assertEqual(0, status["open_stops"])
+
+    def test_never_heard_is_none_not_zero(self) -> None:
+        """0 s ago would read as 'working perfectly' on a device that never reported."""
+        with self.as_roles(COURIER_ROLES), patch.object(
+            api.location_cache, "read_position", return_value=None
+        ), patch.object(api, "_ingest_url", return_value="https://x"):
+            status = api.get_my_tracking_status()
+
+        self.assertIsNone(status["last_position_age_sec"])
+
+    def test_a_non_courier_is_refused(self) -> None:
+        with self.as_roles(NO_ROLES):
+            with self.assertRaises(api.frappe.PermissionError):
+                api.get_my_tracking_status()
+
+
+class TestGetOwnTracksSetup(ApiTestCase):
+    def setup_call(self, *, existing_key=None, existing_secret=None):
+        written = {}
+
+        def _set_value(doctype, name, field, value, **kwargs):
+            written[(doctype, name, field)] = value
+
+        with self.as_roles(COURIER_ROLES), patch.object(
+            api.frappe.db, "get_value", return_value=existing_key, create=True
+        ), patch.object(api.frappe.db, "set_value", side_effect=_set_value, create=True), patch.object(
+            api, "_read_api_secret", return_value=existing_secret
+        ), patch.object(api, "_write_api_secret") as write_secret, patch.object(
+            api, "_new_token", side_effect=["KEYNEW", "SECRETNEW"]
+        ), patch.object(api, "_ingest_url", return_value="https://x/api/method/ingest"):
+            result = api.get_owntracks_setup()
+        return result, written, write_secret
+
+    def test_an_existing_pair_is_reused_never_rotated(self) -> None:
+        """Rotating on every visit would break the phone each time the courier
+        opens the page to check it."""
+        result, written, write_secret = self.setup_call(existing_key="K1", existing_secret="S1")
+
+        self.assertTrue(result["success"])
+        self.assertEqual("K1", result["configuration"]["username"])
+        self.assertEqual("S1", result["configuration"]["password"])
+        self.assertEqual({}, written)
+        write_secret.assert_not_called()
+
+    def test_a_missing_pair_is_minted_for_the_session_user_only(self) -> None:
+        result, written, write_secret = self.setup_call()
+
+        self.assertEqual("KEYNEW", result["configuration"]["username"])
+        self.assertEqual("SECRETNEW", result["configuration"]["password"])
+        self.assertEqual({("User", "courier@example.com", "api_key"): "KEYNEW"}, written)
+        write_secret.assert_called_once_with("courier@example.com", "SECRETNEW")
+
+    def test_a_key_without_a_readable_secret_gets_a_new_secret_only(self) -> None:
+        result, written, write_secret = self.setup_call(existing_key="K1", existing_secret=None)
+
+        self.assertEqual("K1", result["configuration"]["username"])
+        self.assertNotIn(("User", "courier@example.com", "api_key"), written)
+        write_secret.assert_called_once()
+
+    def test_the_inline_url_round_trips_to_the_configuration(self) -> None:
+        import base64 as _b64
+
+        result, _, _ = self.setup_call(existing_key="K1", existing_secret="S1")
+
+        prefix = "owntracks:///config?inline="
+        self.assertTrue(result["inline_url"].startswith(prefix))
+        decoded = json.loads(_b64.b64decode(result["inline_url"][len(prefix):]))
+        self.assertEqual(result["configuration"], decoded)
+        self.assertEqual("configuration", decoded["_type"])
+        self.assertEqual(3, decoded["mode"])
+        self.assertTrue(decoded["url"].endswith("ingest"))
+
+    def test_the_remote_switches_the_server_relies_on_are_on(self) -> None:
+        result, _, _ = self.setup_call(existing_key="K1", existing_secret="S1")
+        cfg = result["configuration"]
+        self.assertTrue(cfg["cmd"] and cfg["remoteConfiguration"] and cfg["allowRemoteLocation"])
+
+    def test_a_non_courier_cannot_mint_a_credential(self) -> None:
+        with self.as_roles(NO_ROLES):
+            with self.assertRaises(api.frappe.PermissionError):
+                api.get_owntracks_setup()
 
 
 class TestGetLivePositions(unittest.TestCase):
