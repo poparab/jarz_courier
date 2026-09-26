@@ -230,6 +230,7 @@ def _install_jarz_pos() -> None:
         SYSTEM_MANAGER = "System Manager"
         JARZ_MANAGER = "JARZ Manager"
         JARZ_LINE_MANAGER = "jarz line manager"
+        JARZ_LINE_MANAGER_ALT = "JARZ line manager"
 
     class WS_EVENTS:
         COURIER_STOP_ARRIVED = "jarz_pos_courier_stop_arrived"

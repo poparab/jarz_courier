@@ -66,7 +66,7 @@ def _ensure_ops_permission() -> None:
     with no operational purpose for them, and it is trivially screenshotted.
     """
     roles = {str(r or "").strip() for r in frappe.get_roles(frappe.session.user)}
-    if roles.isdisjoint(ROLES.COURIER_SUPERVISOR):
+    if roles.isdisjoint(ROLES.COURIER_MAP_VIEWER):
         frappe.throw(
             _("Only a manager can view live courier positions"), frappe.PermissionError
         )

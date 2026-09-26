@@ -41,6 +41,12 @@ class ROLES:
     #: COURIER: a courier confirming their own hand-over is the whole failure mode
     #: the declaration exists to prevent.
     COURIER_SUPERVISOR = {ADMINISTRATOR, SYSTEM_MANAGER, JARZ_MANAGER, JARZ_LINE_MANAGER}
+    #: May watch the live courier map (read-only). The line manager's real Role
+    #: record is the capitalised "JARZ line manager", which COURIER_SUPERVISOR
+    #: does not name, so line managers were refused the map. The owner opened
+    #: the map to them (2026-09-26) WITHOUT widening COURIER_SUPERVISOR, which
+    #: also confirms cash deposits and unbinds devices.
+    COURIER_MAP_VIEWER = COURIER_SUPERVISOR | {POS_ROLES.JARZ_LINE_MANAGER_ALT}
 
 
 # ── Sales Invoice state strings (read-only mirror) ─────────────────────

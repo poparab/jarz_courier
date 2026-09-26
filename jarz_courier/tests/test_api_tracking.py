@@ -572,6 +572,20 @@ class TestGetLivePositions(unittest.TestCase):
         self.assertEqual(["Dokki", "Zamalek"], [b["branch"] for b in result["branches"]])
         self.assertEqual(4, result["count"])
 
+    def test_a_line_manager_holding_the_real_role_record_sees_the_map(self) -> None:
+        """The Role record line managers actually hold is "JARZ line manager";
+        COURIER_SUPERVISOR names only the lowercase spelling, so they were
+        refused. The map (read-only) is open to them; supervisor actions are not."""
+        roles = ["Accounts User", "JARZ line manager", "Moderator", "POS User", "Sales User"]
+        with self.as_roles(roles), patch.object(
+            api.pos_bridge, "get_user_pos_profiles", return_value=["Dokki"]
+        ):
+            result = api.get_live_positions()
+        self.assertEqual(["Dokki"], [b["branch"] for b in result["branches"]])
+        # Opening the map must not have widened deposit confirmation / device unbind.
+        from jarz_courier.constants import ROLES as C
+        self.assertNotIn("JARZ line manager", C.COURIER_SUPERVISOR)
+
     def test_a_courier_cannot_watch_their_colleagues(self) -> None:
         """Surveillance with no operational purpose for them, and easily screenshotted."""
         with self.as_roles(COURIER_ROLES), self.assertRaises(frappe.PermissionError):
