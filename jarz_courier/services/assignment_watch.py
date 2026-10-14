@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import frappe
 
 from jarz_courier.constants import DOCTYPES, DUTY_STATUS, QUERY_LIMITS, RUN_STATUS
-from jarz_courier.services import location_cache, push, run_sheet
+from jarz_courier.services import location_cache, push, run_sheet, tamper_watch
 
 #: Couriers examined per pass. Well above any realistic simultaneous-shift count;
 #: it exists so a data problem cannot turn one tick into a full table scan.
@@ -199,7 +199,15 @@ def active_couriers(*, limit: int = MAX_COURIERS_PER_SWEEP) -> List[Tuple[str, s
 def scheduled_sweep() -> Dict[str, Any]:
     """Scheduler entry point. Swallows everything."""
     try:
-        return sweep()
+        summary = sweep()
     except Exception:
         frappe.log_error(frappe.get_traceback(), "jarz_courier: scheduled_sweep failed")
-        return {"error": True}
+        summary = {"error": True}
+
+    # Its own guard: the tamper check runs even when the assignment pass failed, and
+    # a failure here never changes what the sweep reports.
+    try:
+        tamper_watch.check_tracking_lost()
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier: tracking-lost check failed")
+    return summary

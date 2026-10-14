@@ -34,6 +34,9 @@ class FakeMessaging:
     def __init__(self):
         self.sent = []
         self.errors = {}
+        # Only ops pushes (to the POS app) may carry a tray block. Courier tests leave
+        # this False so any regression on the courier path fails loudly.
+        self.allow_notification = False
 
     # ── the SDK's builders, reduced to plain records ────────────────────
     class AndroidNotification(dict):
@@ -51,11 +54,13 @@ class FakeMessaging:
     def Aps(self, **kwargs):
         return {"_kind": "aps", **kwargs}
 
-    def Notification(self, **kwargs):  # pragma: no cover - must never be used
-        raise AssertionError(
-            "push must never attach a notification block — that moves delivery to the "
-            "system tray and stops the app's background handler from running."
-        )
+    def Notification(self, **kwargs):
+        if not self.allow_notification:
+            raise AssertionError(
+                "a courier push must never attach a notification block — that moves "
+                "delivery to the system tray and stops the app's background handler."
+            )
+        return {"_kind": "notification", **kwargs}
 
     def Message(self, **kwargs):
         return kwargs
@@ -334,6 +339,10 @@ class TestStalePingAlert(PushTestCase):
         "party": "HR-EMP-00042",
     }
 
+    def setUp(self) -> None:
+        super().setUp()
+        self.messaging.allow_notification = True  # an ops push, see the tray-block test
+
     def test_the_alert_goes_to_ops_and_not_to_the_courier(self) -> None:
         """Pushing "your app stopped reporting" to the app that stopped reporting is
         a message to nobody. The failure the watchdog detects is the failure that
@@ -365,6 +374,41 @@ class TestStalePingAlert(PushTestCase):
             result = push.notify_stale_ping(run=self.RUN, silent_minutes=35, reason="quiet")
 
         self.assertEqual("skipped_no_tokens", result["status"])
+
+    def test_the_ops_alert_carries_a_tray_block(self) -> None:
+        """The POS app raises no local notification for a data-only push, so without
+        a tray block the line manager would never see the alert."""
+        self.messaging.allow_notification = True
+        with patch.object(
+            push.pos_bridge, "resolve_branch_recipients", return_value=["ops@example.com"]
+        ), patch.object(push, "user_tokens", return_value=["ops-tok"]):
+            push.notify_stale_ping(run=self.RUN, silent_minutes=35, reason="no position")
+
+        message = self.messaging.sent[0]
+        self.assertIn("35 min", message["notification"]["body"])
+        self.assertEqual("alert", message["apns"]["headers"]["apns-push-type"])
+        self.assertEqual(PUSH_TYPE.STALE_PING, message["data"]["type"])
+
+
+class TestOpsNotificationShape(PushTestCase):
+    def test_a_notification_switches_ios_to_an_alert_push(self) -> None:
+        self.messaging.allow_notification = True
+        push.send(["tok-1"], data={"type": "x"}, notification=("T", "B"))
+        message = self.messaging.sent[0]
+        self.assertEqual({"_kind": "notification", "title": "T", "body": "B"}, message["notification"])
+        self.assertEqual("alert", message["apns"]["headers"]["apns-push-type"])
+        self.assertEqual("10", message["apns"]["headers"]["apns-priority"])
+        self.assertEqual("high", message["android"]["priority"])
+        self.assertEqual("x", message["data"]["type"])
+
+    def test_courier_wake_pushes_still_carry_none(self) -> None:
+        with patch.object(
+            push, "courier_device_tokens", return_value=[{"name": "DEV-1", "token": "c-tok"}]
+        ):
+            push.send_to_courier(
+                party_type="Employee", party="HR-EMP-1", data={"type": PUSH_TYPE.RUN_CHANGED}
+            )
+        self.assertNotIn("notification", self.messaging.sent[0])
 
 
 if __name__ == "__main__":  # pragma: no cover

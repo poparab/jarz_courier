@@ -34,6 +34,7 @@ from frappe import _
 from frappe.utils import flt
 
 from jarz_courier.constants import DOCTYPES, INVOICE_STATE, QUERY_LIMITS
+from jarz_courier.services import pos_bridge
 
 #: Fields that exist on every ERPNext Sales Invoice plus jarz_pos fixtures that
 #: predate this project. Safe to select unconditionally.
@@ -161,7 +162,8 @@ def get_run(
         rows = sorted(rows, key=_sequence_key)
 
     address_map = _load_addresses(rows)
-    stops = [_stop_summary(row, address_map) for row in rows]
+    code_required = delivery_code_required()
+    stops = [_stop_summary(row, address_map, code_required=code_required) for row in rows]
 
     return {"stops": stops, "totals": _totals(stops), "branches": branch_list}
 
@@ -184,7 +186,7 @@ def get_stop(*, invoice_id: str) -> Dict[str, Any]:
 
     row = rows[0]
     address_map = _load_addresses([row])
-    stop = _stop_summary(row, address_map)
+    stop = _stop_summary(row, address_map, code_required=delivery_code_required())
     stop["items"] = _item_summary(name)
     stop["notes"] = _invoice_notes(name)
     stop["proofs"] = _proofs(name)
@@ -209,7 +211,21 @@ def _coerce_sequence(value: Any) -> int:
         return 0
 
 
-def _stop_summary(row: Dict[str, Any], address_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+def delivery_code_required() -> bool:
+    """Whether jarz_pos asks the courier for the customer's 4-digit code on delivery.
+
+    Read once per payload rather than per stop. The flag lives on ``Jarz POS Settings``
+    and is enforced by jarz_pos; this only tells the app whether to show the field.
+    """
+    return bool(pos_bridge.get_pos_setting("require_delivery_code", 0))
+
+
+def _stop_summary(
+    row: Dict[str, Any],
+    address_map: Dict[str, Dict[str, Any]],
+    *,
+    code_required: bool = False,
+) -> Dict[str, Any]:
     address_name = row.get("shipping_address_name") or row.get("customer_address") or ""
     address = address_map.get(address_name, {})
 
@@ -256,6 +272,7 @@ def _stop_summary(row: Dict[str, Any], address_map: Dict[str, Dict[str, Any]]) -
         "attempt_no": int(row.get("custom_delivery_attempt_no") or 0),
         "failure_reason": row.get("custom_delivery_failure_reason") or "",
         "remarks": row.get("remarks") or "",
+        "delivery_code_required": bool(code_required),
     }
 
 

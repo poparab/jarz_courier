@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import logging
 from datetime import timedelta
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import frappe
 
@@ -182,8 +182,14 @@ def send(
     ttl_sec: int = DEFAULT_TTL_SEC,
     collapse_key: Optional[str] = None,
     on_dead_token: Optional[Any] = None,
+    notification: Optional[Tuple[str, str]] = None,
 ) -> Dict[str, Any]:
     """Send one high-priority, data-only message per token. Never raises.
+
+    ``notification`` is a ``(title, body)`` pair for **ops** pushes only. Those go to
+    the POS app, whose handler refreshes and routes on them but never raises a local
+    notification, so without a tray block a line manager would see nothing at all.
+    Courier wake messages must keep leaving it out (see the module docstring).
 
     ``collapse_key`` matters more than it looks: without it, a courier who comes back
     online after an hour receives every queued run-changed message in sequence and
@@ -230,7 +236,9 @@ def send(
 
     for token in batch:
         try:
-            messaging.send(_build_message(token, payload, ttl_sec, collapse_key))
+            messaging.send(
+                _build_message(token, payload, ttl_sec, collapse_key, notification)
+            )
             result["sent"] += 1
         except Exception as exc:  # noqa: BLE001 - per-token accounting is the point
             result["failed"] += 1
@@ -254,20 +262,41 @@ def send(
     return result
 
 
-def _build_message(token: str, data: Dict[str, str], ttl_sec: int, collapse_key: Optional[str]):
-    """A data-only message. **There is no ``notification=`` argument, on purpose.**
+def _build_message(
+    token: str,
+    data: Dict[str, str],
+    ttl_sec: int,
+    collapse_key: Optional[str],
+    notification: Optional[Tuple[str, str]] = None,
+):
+    """A data-only message unless ``notification`` is given.
 
-    Adding one would move delivery to the system tray and stop the app's handler from
-    running in the background — see the module docstring. The client is responsible
-    for raising a local notification if the payload deserves one, which also lets it
-    localise the text; server strings here are English and would break the Arabic UI
-    if surfaced verbatim.
+    Courier messages never carry one: it would move delivery to the system tray and
+    stop the courier app's handler from running in the background — see the module
+    docstring. The courier client raises its own local notification, which also lets
+    it localise the text.
+
+    Ops messages (``notification`` set) go to the POS app, which shows nothing for a
+    data-only push. They get a tray block and a normal alert-type APNS config; the
+    data still rides along so a tap routes to the right screen.
     """
     android = messaging.AndroidConfig(
         priority="high",
         ttl=timedelta(seconds=int(ttl_sec)),
         collapse_key=collapse_key,
     )
+    if notification:
+        title, body = notification
+        return messaging.Message(
+            data=data,
+            notification=messaging.Notification(title=str(title or ""), body=str(body or "")),
+            android=android,
+            apns=messaging.APNSConfig(
+                headers={"apns-priority": "10", "apns-push-type": "alert"},
+                payload=messaging.APNSPayload(aps=messaging.Aps(sound="default")),
+            ),
+            token=token,
+        )
     apns = messaging.APNSConfig(
         headers={"apns-priority": "5", "apns-push-type": "background"},
         payload=messaging.APNSPayload(aps=messaging.Aps(content_available=True)),
@@ -437,6 +466,86 @@ def notify_stale_ping(
         },
         ttl_sec=ALERT_TTL_SEC,
         collapse_key=f"stale_ping::{run.get('name')}",
+        notification=(
+            "انقطع تتبع المندوب",
+            f"Courier tracking silent for {silent_minutes} min ({run.get('name')})",
+        ),
     )
     result["recipients"] = len(recipients)
     return result
+
+
+def _party_display_name(party_type: Any, party: Any) -> str:
+    """Human name for a courier party, falling back to the id. Never raises."""
+    pt, pid = str(party_type or ""), str(party or "")
+    field = {"Employee": "employee_name", "Supplier": "supplier_name"}.get(pt)
+    if not (field and pid):
+        return pid
+    try:
+        return str(frappe.db.get_value(pt, pid, field) or pid)
+    except Exception:
+        return pid
+
+
+_ANOMALY_TITLES_AR = {
+    "High": "تنبيه مهم من المناديب",
+    "Medium": "تنبيه من المناديب",
+}
+
+
+def notify_anomaly(doc: Any) -> Dict[str, Any]:
+    """Tell the branch's ops users about a freshly filed Courier Anomaly (F7).
+
+    ``doc`` is the just-inserted ``Courier Anomaly``. Stale Ping findings are not
+    pushed from here: ``watch_stale_pings`` already sends its own
+    ``courier_stale_ping`` and two pushes for one event is noise. Never raises.
+
+    The data payload is the contract's ``{"type": "courier_alert", "anomaly",
+    "anomaly_type", "severity", "invoice", "party_name"}`` plus ``title``,
+    ``body`` and ``body_ar``, and ``branch``. It also carries a tray block: the
+    POS app shows nothing for a data-only push.
+    """
+    try:
+        get = doc.get if hasattr(doc, "get") else (lambda k, d=None: getattr(doc, k, d))
+        branch = str(get("branch") or "")
+        severity = str(get("severity") or "")
+        anomaly_type = str(get("anomaly_type") or "")
+        party_name = _party_display_name(get("party_type"), get("party"))
+        invoice = str(get("sales_invoice") or "")
+        reason = str(get("reason") or "")
+
+        recipients = pos_bridge.resolve_branch_recipients([branch] if branch else [])
+        tokens = user_tokens(recipients)
+
+        title = f"Courier alert ({severity}): {anomaly_type}"
+        body = f"{party_name} - {reason}" if reason else party_name
+        if invoice:
+            body = f"{body} [{invoice}]"
+        body_ar = f"{_ANOMALY_TITLES_AR.get(severity, 'تنبيه من المناديب')}: {party_name}"
+
+        result = send(
+            tokens,
+            data={
+                "type": PUSH_TYPE.COURIER_ALERT,
+                "anomaly": get("name"),
+                "anomaly_type": anomaly_type,
+                "severity": severity,
+                "invoice": invoice,
+                "party_name": party_name,
+                "branch": branch,
+                "title": title,
+                "body": body[:240],
+                "body_ar": body_ar,
+            },
+            ttl_sec=ALERT_TTL_SEC,
+            collapse_key=f"courier_alert::{get('name')}",
+            notification=(body_ar, body[:240]),
+        )
+        result["recipients"] = len(recipients)
+        return result
+    except Exception:
+        try:
+            frappe.log_error(frappe.get_traceback(), "jarz_courier: anomaly push failed")
+        except Exception:
+            pass
+        return {"ok": False, "status": "error", "attempted": 0, "sent": 0, "failed": 0}

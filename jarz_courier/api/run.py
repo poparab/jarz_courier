@@ -26,13 +26,47 @@ import frappe
 from frappe import _
 
 from jarz_courier.constants import INVOICE_STATE, QUERY_LIMITS, ROLES
-from jarz_courier.services import courier_onboarding, pos_bridge, run_sheet
+from jarz_courier.services import action_gate, courier_onboarding, pos_bridge, run_sheet
 
 
 def _ensure_run_permission() -> None:
     roles = {str(r or "").strip() for r in frappe.get_roles(frappe.session.user)}
     if roles.isdisjoint(ROLES.COURIER_SELF | ROLES.COURIER_SUPERVISOR):
         frappe.throw(_("You are not permitted to view a courier run"), frappe.PermissionError)
+
+
+#: Refusals the app branches on by ``exc_type``. They must reach the client as the
+#: raised exception: flattened into ``{"success": False, "error"}`` the app could only
+#: show the sentence, and could not tell "go closer" from "enter the code again".
+_DELIVERY_CODE_ERRORS = ("DeliveryCodeRequired", "DeliveryCodeWrong", "DeliveryCodeLocked")
+
+
+def _is_structured_refusal(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, (frappe.PermissionError,) + action_gate.REFUSAL_TYPES)
+        or type(exc).__name__ in _DELIVERY_CODE_ERRORS
+    )
+
+
+def _gate_action(
+    invoice_id: str,
+    action: str,
+    latitude: Any,
+    longitude: Any,
+    accuracy_m: Any,
+    is_mocked: Any,
+) -> None:
+    """Refuse the action unless the server can vouch for the courier's position."""
+    if not action_gate.is_enabled():
+        return
+    action_gate.assert_action_allowed(
+        invoice_id,
+        action,
+        _as_float(latitude),
+        _as_float(longitude),
+        _as_float(accuracy_m),
+        _as_bool(is_mocked),
+    )
 
 
 @frappe.whitelist(allow_guest=False)
@@ -66,6 +100,7 @@ def get_my_run(
                 "display_name": identity.get("display_name"),
                 "branch": identity["branch"],
             },
+            "action_gate": action_gate.get_settings(),
             **result,
         }
     except frappe.PermissionError:
@@ -96,11 +131,18 @@ def mark_arrived(
     longitude: Optional[float] = None,
     accuracy_m: Optional[float] = None,
     request_id: Optional[str] = None,
+    is_mocked: Any = False,
 ) -> Dict[str, Any]:
-    """Courier reached the door. Delegates to jarz_pos lane A3."""
+    """Courier reached the door. Delegates to jarz_pos lane A3.
+
+    ``is_mocked`` is only read by the action gate; jarz_pos has no use for it here.
+    """
     _ensure_run_permission()
     try:
         _assert_stop_access(invoice_id, action_label="marking arrival")
+        _gate_action(
+            invoice_id, action_gate.ACTION_ARRIVED, latitude, longitude, accuracy_m, is_mocked
+        )
         return pos_bridge.mark_invoice_arrived(
             invoice_id,
             latitude=_as_float(latitude),
@@ -108,9 +150,9 @@ def mark_arrived(
             accuracy_m=_as_float(accuracy_m),
             request_id=request_id,
         )
-    except frappe.PermissionError:
-        raise
     except Exception as exc:
+        if _is_structured_refusal(exc):
+            raise
         frappe.log_error(frappe.get_traceback(), "jarz_courier mark_arrived failed")
         return {"success": False, "error": str(exc)}
 
@@ -125,8 +167,13 @@ def mark_delivered(
     recipient_name: Optional[str] = None,
     is_mocked: Any = False,
     request_id: Optional[str] = None,
+    delivery_code: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Order handed over. Delegates to jarz_pos lane A3.
+
+    ``delivery_code`` is the customer's 4-digit code. jarz_pos checks it (when its
+    ``require_delivery_code`` switch is on) and counts the wrong attempts; this layer
+    only forwards it and files a finding when the answer is wrong or locked.
 
     ``request_id`` is passed straight through: the contract's dual-idempotency rule
     pairs it with a deterministic ``"<invoice>::delivered"`` token on the jarz_pos
@@ -136,20 +183,34 @@ def mark_delivered(
     """
     _ensure_run_permission()
     try:
-        _assert_stop_access(invoice_id, action_label="marking delivery")
-        return pos_bridge.mark_invoice_delivered(
-            invoice_id,
-            latitude=_as_float(latitude),
-            longitude=_as_float(longitude),
-            accuracy_m=_as_float(accuracy_m),
-            collected_amount=_as_float(collected_amount),
-            recipient_name=recipient_name,
-            is_mocked=_as_bool(is_mocked),
-            request_id=request_id,
+        row = _assert_stop_access(invoice_id, action_label="marking delivery")
+        _gate_action(
+            invoice_id, action_gate.ACTION_DELIVERED, latitude, longitude, accuracy_m, is_mocked
         )
-    except frappe.PermissionError:
-        raise
+        try:
+            return pos_bridge.mark_invoice_delivered(
+                invoice_id,
+                latitude=_as_float(latitude),
+                longitude=_as_float(longitude),
+                accuracy_m=_as_float(accuracy_m),
+                collected_amount=_as_float(collected_amount),
+                recipient_name=recipient_name,
+                is_mocked=_as_bool(is_mocked),
+                request_id=request_id,
+                delivery_code=delivery_code,
+            )
+        except Exception as exc:
+            # Matched by class name: the exceptions are jarz_pos's, and importing them
+            # would couple this module to a jarz_pos that may be a deploy behind.
+            name = type(exc).__name__
+            if name in ("DeliveryCodeWrong", "DeliveryCodeLocked"):
+                action_gate.flag_delivery_code_failure(
+                    invoice_id, locked=name == "DeliveryCodeLocked", message=str(exc), row=row
+                )
+            raise
     except Exception as exc:
+        if _is_structured_refusal(exc):
+            raise
         frappe.log_error(frappe.get_traceback(), "jarz_courier mark_delivered failed")
         return {"success": False, "error": str(exc)}
 
@@ -212,6 +273,7 @@ def mark_failed(
     accuracy_m: Optional[float] = None,
     notes: Optional[str] = None,
     request_id: Optional[str] = None,
+    is_mocked: Any = False,
 ) -> Dict[str, Any]:
     """Delivery attempt failed.
 
@@ -223,6 +285,9 @@ def mark_failed(
     _ensure_run_permission()
     try:
         _assert_stop_access(invoice_id, action_label="marking a failed delivery")
+        _gate_action(
+            invoice_id, action_gate.ACTION_FAILED, latitude, longitude, accuracy_m, is_mocked
+        )
         return pos_bridge.mark_invoice_failed(
             invoice_id,
             failure_reason=failure_reason,
@@ -232,9 +297,9 @@ def mark_failed(
             notes=notes,
             request_id=request_id,
         )
-    except frappe.PermissionError:
-        raise
     except Exception as exc:
+        if _is_structured_refusal(exc):
+            raise
         frappe.log_error(frappe.get_traceback(), "jarz_courier mark_failed failed")
         return {"success": False, "error": str(exc)}
 

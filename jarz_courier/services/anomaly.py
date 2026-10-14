@@ -184,12 +184,49 @@ def flag(
         doc.insert(ignore_permissions=True)
 
         _logger().info(f"jarz_courier: anomaly {doc.name} {anomaly_type}/{severity} key={key}")
+        _push_new_finding(doc)
         return {"anomaly": doc.name, "created": True}
     except frappe.DuplicateEntryError:
         return {"anomaly": None, "created": False, "reason": "already flagged"}
     except Exception:
         frappe.log_error(frappe.get_traceback(), f"jarz_courier: anomaly flag failed ({key})")
         return {"anomaly": None, "created": False, "reason": "error"}
+
+
+def should_push(anomaly_type: Any, severity: Any) -> bool:
+    """Contract F7: push a NEW finding of Medium or worse.
+
+    Stale Ping is excluded because ``watch_stale_pings`` already pushes its own
+    ``courier_stale_ping`` for the same event.
+    """
+    if anomaly_type == ANOMALY_TYPE.STALE_PING:
+        return False
+    return SEVERITY.RANK.get(str(severity or ""), 0) >= SEVERITY.RANK[SEVERITY.MEDIUM]
+
+
+def _push_new_finding(doc: Any) -> None:
+    """Fan a freshly inserted finding out to the branch's ops. Never raises.
+
+    Deferred to after the transaction commits when Frappe offers the hook: a caller
+    that files a finding and then raises (the scan-to-deliver refusal does) has its
+    insert rolled back, and a push for a row that no longer exists would send ops to
+    an alert they cannot open.
+    """
+    try:
+        if not should_push(doc.anomaly_type, doc.severity):
+            return
+        from jarz_courier.services import push  # local: push imports pos_bridge too
+
+        def _send() -> None:
+            push.notify_anomaly(doc)
+
+        after_commit = getattr(getattr(frappe.db, "after_commit", None), "add", None)
+        if callable(after_commit):
+            after_commit(_send)
+        else:
+            _send()
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier: anomaly push scheduling failed")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

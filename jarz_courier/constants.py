@@ -22,6 +22,8 @@ class DOCTYPES:
     COURIER_RUN = "Courier Run"
     #: B9 — a flag, never a charge. See the doctype's own docstring.
     COURIER_ANOMALY = "Courier Anomaly"
+    #: Left Branch / Arrived / Back At Branch milestones, one row per (invoice, event).
+    COURIER_STOP_EVENT = "Courier Stop Event"
 
 
 # ── Roles ───────────────────────────────────────────────────────────────
@@ -127,6 +129,11 @@ class ANOMALY_TYPE:
     MOCK_GPS = "Mock GPS"
     UNEXPECTED_STOP = "Unexpected Stop"
     STALE_PING = "Stale Ping"
+    # Launch hardening (courier-launch, 2026-10-14)
+    TRACKER_MODE_CHANGED = "Tracker Mode Changed"
+    TRACKING_LOST = "Tracking Lost"
+    ACTION_REFUSED = "Action Refused"
+    DELIVERY_CODE_FAILED = "Delivery Code Failed"
 
     ALL = (
         DETOUR,
@@ -137,7 +144,21 @@ class ANOMALY_TYPE:
         MOCK_GPS,
         UNEXPECTED_STOP,
         STALE_PING,
+        TRACKER_MODE_CHANGED,
+        TRACKING_LOST,
+        ACTION_REFUSED,
+        DELIVERY_CODE_FAILED,
     )
+
+
+# ── Order timeline stop events (courier-launch) ────────────────────────
+
+class STOP_EVENT:
+    LEFT_BRANCH = "Left Branch"
+    ARRIVED = "Arrived"
+    BACK_AT_BRANCH = "Back At Branch"
+
+    ALL = (LEFT_BRANCH, ARRIVED, BACK_AT_BRANCH)
 
 
 class SEVERITY:
@@ -216,6 +237,8 @@ class PUSH_TYPE:
     RUN_CHANGED = "courier_run_changed"
     DEPOSIT_CONFIRMED = "courier_deposit_confirmed"
     STALE_PING = "courier_stale_ping"
+    #: Contract F7: a new Medium-or-higher Courier Anomaly, pushed to the branch ops.
+    COURIER_ALERT = "courier_alert"
 
 
 # ── Query limits ────────────────────────────────────────────────────────

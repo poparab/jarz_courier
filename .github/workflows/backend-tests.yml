@@ -177,8 +177,19 @@ jobs:
             # the geo fields; every pin write goes through jarz_pos).
             test_consensus_pin
             test_push
+            # Courier launch (C2): the ops alert feed, the push on a new finding, and
+            # courier setup from the POS app (the PIN and account-protection rules).
+            test_anomaly_push
+            test_alerts
+            test_onboarding
             test_assignment_watch
             test_api_tracking
+            # Courier launch (C1): stop milestones, the order timeline, the F6 action
+            # gate (+ delivery-code pass-through) and the tamper detectors.
+            test_stop_events
+            test_timeline
+            test_action_gate
+            test_tamper_watch
           )
           rc=0
           for m in "${MODULES[@]}"; do

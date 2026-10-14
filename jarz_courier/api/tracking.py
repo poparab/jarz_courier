@@ -45,6 +45,8 @@ from jarz_courier.services import (
     owntracks_steering,
     pos_bridge,
     run_sheet,
+    stop_events,
+    tamper_watch,
     tracking,
 )
 
@@ -99,23 +101,25 @@ def ingest_ping(
         identity = courier_onboarding.resolve_active_branch(branch, action_label="location tracking")
         open_duty = duty_session.get_open_duty(identity["party_type"], identity["party"])
 
+        pings = [
+            {
+                "lat": latitude,
+                "lng": longitude,
+                "accuracy": accuracy_m,
+                "heading": heading,
+                "speed": speed,
+                "ts": timestamp,
+                "is_mocked": is_mocked,
+            }
+        ]
         result = tracking.ingest(
             party_type=identity["party_type"],
             party=identity["party"],
             branch=identity["branch"],
-            pings=[
-                {
-                    "lat": latitude,
-                    "lng": longitude,
-                    "accuracy": accuracy_m,
-                    "heading": heading,
-                    "speed": speed,
-                    "ts": timestamp,
-                    "is_mocked": is_mocked,
-                }
-            ],
+            pings=pings,
             duty=(open_duty or {}).get("name"),
         )
+        _record_stop_events(identity, pings, run=result.get("run"), source=stop_events.SOURCE_APP)
         return {"success": True, **result}
     except frappe.PermissionError:
         raise
@@ -251,7 +255,13 @@ def _ingest_owntracks(payload: Dict[str, Any]) -> Dict[str, Any]:
                 duty=(open_duty or {}).get("name"),
             )
             result.update(ingested)
+            _record_stop_events(
+                identity, [fix], run=ingested.get("run"), source=stop_events.SOURCE_OWNTRACKS
+            )
 
+        # Before steering: the check needs the mode the device reported *last*, and
+        # _steer_device overwrites it with this message's.
+        tamper_watch.check_mode_change(identity, meta.get("mode"))
         result["commands"] = _steer_device(identity, meta, carries_position=fix is not None)
         return result
     except frappe.PermissionError:
@@ -311,6 +321,50 @@ def _open_stops(identity: Dict[str, Any]) -> List[Dict[str, Any]]:
     except Exception:
         frappe.log_error(frappe.get_traceback(), "jarz_courier owntracks run lookup failed")
         return []
+
+
+def _record_stop_events(
+    identity: Dict[str, Any],
+    pings: List[Dict[str, Any]],
+    *,
+    run: Optional[str],
+    source: str,
+) -> None:
+    """Hand freshly ingested fixes to the stop-milestone detector. Never raises.
+
+    The position is already stored by the time this runs, so nothing here may turn a
+    good ingest into an error the phone would retry. The run sheet is only read when
+    at least one fix is a real, well-formed position: a batch of mocked or malformed
+    pings costs no query.
+    """
+    try:
+        reference = time.time()
+        fixes: List[Dict[str, Any]] = []
+        for raw in pings or []:
+            fix = tracking.normalise_fix(
+                raw,
+                party_type=identity["party_type"],
+                party=identity["party"],
+                branch=identity["branch"],
+                run=run,
+                now_epoch=reference,
+            )
+            if isinstance(fix, dict) and not fix.get("is_mocked"):
+                fixes.append(fix)
+        if not fixes:
+            return
+
+        stop_events.process_fixes(
+            party_type=identity["party_type"],
+            party=identity["party"],
+            branch=identity["branch"],
+            fixes=fixes,
+            stops=_open_stops(identity),
+            run=run,
+            source=source,
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "jarz_courier stop event hook failed")
 
 
 def _owntracks_response(result: Dict[str, Any]) -> Any:
@@ -525,6 +579,7 @@ def ingest_pings(pings: Any = None) -> Dict[str, Any]:
             pings=batch,
             duty=(open_duty or {}).get("name"),
         )
+        _record_stop_events(identity, batch, run=result.get("run"), source=stop_events.SOURCE_APP)
         return {"success": True, **result}
     except frappe.PermissionError:
         raise

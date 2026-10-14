@@ -88,6 +88,22 @@ def _call(dotted: str, func_name: str, *args: Any, **kwargs: Any) -> Any:
     return func(*args, **kwargs)
 
 
+def get_pos_setting(fieldname: str, default: Any = None) -> Any:
+    """One value from ``Jarz POS Settings``, or ``default`` when unset or absent.
+
+    Courier switches live on the jarz_pos Single so operators flip every
+    delivery lever in one Desk form. A field this server's jarz_pos does not
+    have yet reads as ``default`` instead of throwing, so the courier app keeps
+    working across a deploy-order gap. Singles also ignore new field defaults,
+    so callers must pass the real default here rather than trust the JSON.
+    """
+    try:
+        value = frappe.db.get_single_value("Jarz POS Settings", fieldname)
+    except Exception:
+        return default
+    return default if value in (None, "") else value
+
+
 # ---------------------------------------------------------------------------
 # Identity — who is the logged-in user, as a courier?
 # ---------------------------------------------------------------------------
@@ -308,7 +324,17 @@ def mark_invoice_delivered(
     recipient_name: str | None = None,
     is_mocked: bool = False,
     request_id: str | None = None,
+    delivery_code: str | None = None,
 ) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {}
+    # The customer's delivery code is enforced inside jarz_pos. An older jarz_pos has
+    # neither kwarg, and passing one it does not know would turn every delivery into
+    # a TypeError - so only send them when the function accepts them.
+    accepted = _accepted_kwargs("jarz_pos.services.courier_delivery", "mark_invoice_delivered")
+    if "delivery_code" in accepted:
+        kwargs["delivery_code"] = delivery_code
+    if "enforce_code" in accepted:
+        kwargs["enforce_code"] = True
     return _call(
         "jarz_pos.services.courier_delivery",
         "mark_invoice_delivered",
@@ -320,7 +346,19 @@ def mark_invoice_delivered(
         recipient_name=recipient_name,
         is_mocked=is_mocked,
         request_id=request_id,
+        **kwargs,
     )
+
+
+def _accepted_kwargs(dotted: str, func: str) -> set:
+    """Parameter names ``dotted.func`` takes; empty when it cannot be inspected."""
+    try:
+        import inspect
+
+        fn = getattr(importlib.import_module(dotted), func)
+        return set(inspect.signature(fn).parameters)
+    except Exception:
+        return set()
 
 
 def mark_invoice_failed(
@@ -609,3 +647,125 @@ def list_failure_reasons() -> list:
             frappe.get_traceback(), "jarz_courier: failure reason lookup failed"
         )
         return []
+
+
+# ---------------------------------------------------------------------------
+# Onboarding / alerts (C2)
+#
+# Courier setup is done from the POS app's Users screen, so it goes through the
+# same door and the same protection rules as ``jarz_pos.services.user_admin``.
+# Those rules (who may touch a manager's account, how an Employee is linked
+# without HRMS side effects, how a branch grant is logged) live in jarz_pos and
+# are reached here rather than copied, for the reason given at the top of this
+# module. Several of the targets are underscore-prefixed because jarz_pos
+# exposes no public form of them; the wrappers below are the single place this
+# app depends on those names, so a rename in jarz_pos fails here, loudly, as
+# ``PosBridgeUnavailable`` instead of deep inside a setup request.
+# ---------------------------------------------------------------------------
+
+_USER_ADMIN = "jarz_pos.services.user_admin"
+_DELIVERY_PARTY = "jarz_pos.services.delivery_party"
+_COURIER_IDENTITY = "jarz_pos.services.courier_identity"
+_BRANCH_ACCESS = "jarz_pos.services.branch_access"
+
+#: ``courier_identity`` caches the delivery group's members here for one request.
+_DELIVERY_GROUP_CACHE_KEY = "jarz_delivery_group_employees"
+
+
+def ensure_user_admin_access() -> None:
+    """Throw ``PermissionError`` unless the caller may use the Users screen.
+
+    JARZ Manager, System Manager or Administrator.
+    """
+    _call(_USER_ADMIN, "ensure_access")
+
+
+def ensure_can_modify_user(user: str) -> Dict[str, Any]:
+    """Resolve *user* and assert the caller may change that account.
+
+    Refuses the built-in accounts, any System Manager account unless the caller is
+    one, and another JARZ Manager's account. Returns the ``{name, full_name,
+    enabled, user_type}`` row.
+    """
+    return _call(_USER_ADMIN, "_ensure_can_modify", user)
+
+
+def apply_role_profiles(doc: Any, names: Sequence[str]) -> None:
+    """Set a User document's Role Profiles (and the matching Module Profile).
+
+    Roles are only ever granted through a profile: Frappe v16 rebuilds
+    ``User.roles`` from the profiles on every save and silently drops the rest.
+    Refuses a profile that grants system-administrator rights unless the caller is
+    a System Manager.
+    """
+    _call(_USER_ADMIN, "_apply_profiles", doc, list(names))
+
+
+def link_employee_to_user(user: str, employee: str) -> None:
+    """Point an Employee at a User without running ``Employee.save()``.
+
+    Saving an Employee runs HRMS user-permission hooks that have locked staff out
+    of customers before; ``user_admin`` writes the link directly and audits it.
+    """
+    _call(_USER_ADMIN, "_link_employee", user, employee)
+
+
+def sign_out_everywhere(user: str) -> None:
+    """End every session of *user* (best effort; jarz_pos logs a failure)."""
+    _call(_USER_ADMIN, "_sign_out_everywhere", user)
+
+
+def ensure_branch(branch_name: str) -> str:
+    """The Branch record named *branch_name*, created if absent; ``""`` if none."""
+    return str(_call(_DELIVERY_PARTY, "_ensure_branch", branch_name) or "")
+
+
+def create_delivery_employee(
+    *, name: str, phone: Optional[str] = None, branch: Optional[str] = None
+) -> Dict[str, Any]:
+    """Create an Employee in the Delivery group, the way the POS courier picker does.
+
+    Returns ``{"party_type", "party", "display_name", ...}``. **A same-name
+    Employee is reused, not duplicated** - callers that must not adopt somebody
+    else's record check for a clash first.
+    """
+    return _call(
+        _DELIVERY_PARTY,
+        "create_delivery_party",
+        "Employee",
+        name=name,
+        phone=phone,
+        branch=branch,
+    )
+
+
+def ensure_employee_in_delivery_group(employee: str) -> None:
+    """Add an Employee to the Delivery Employee Group (idempotent).
+
+    Also drops the request-local membership cache, so an ``is_delivery_courier``
+    asked later in the same request sees the new row.
+    """
+    _call(_DELIVERY_PARTY, "_ensure_employee_in_group", employee)
+    try:
+        setattr(frappe.local, _DELIVERY_GROUP_CACHE_KEY, None)
+    except Exception:
+        pass
+
+
+def delivery_group_employees() -> set:
+    """Employee ids in the Delivery group."""
+    return set(_call(_COURIER_IDENTITY, "delivery_group_employees") or [])
+
+
+def grant_branch_access(user: str, pos_profile: str, notes: Optional[str] = None) -> Dict[str, Any]:
+    """Make *user* a permanent member of *pos_profile* (a ``POS Profile User`` row).
+
+    Audit-logged by jarz_pos, and refused while that branch has an open shift -
+    jarz_pos's own rule for any membership change. Returns ``{"changed": bool,
+    ...}``; ``changed`` is False when the row already existed.
+    """
+    return _call(_BRANCH_ACCESS, "set_branch_access", user, pos_profile, True, notes)
+
+
+def is_branch_member(user: str, pos_profile: str) -> bool:
+    return bool(_call(_BRANCH_ACCESS, "is_member", user, pos_profile))

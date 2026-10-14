@@ -163,3 +163,20 @@ try:
     _tracking.get_live_positions
 except Exception:
     pass
+
+try:
+    from jarz_courier.api import timeline as _timeline
+
+    _timeline.get_order_timeline
+except Exception:
+    pass
+
+try:
+    from jarz_courier.api import alerts as _alerts  # noqa: F401
+except Exception:
+    pass
+
+try:
+    from jarz_courier.api import onboarding as _onboarding  # noqa: F401
+except Exception:
+    pass
